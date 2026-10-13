@@ -1,0 +1,30 @@
+diff --git a/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs b/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
+index 3e24a2ba..093b8126 100644
+--- a/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
++++ b/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
+@@ -1525,4 +1525,25 @@ mod tests {
+             expected_schema.to_string()
+         )
+     }
++
++    #[tokio::test]
++    async fn repro_4678_nested_schema_override_prunes_parquet_read_schema() -> TestResult {
++        let mut table = open_fs_path("../test/tests/data/table_with_null_stats_in_notnull_struct");
++        table.load().await?;
++        let snapshot = table.snapshot()?.snapshot().snapshot();
++        let override_schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
++            "s",
++            DataType::Struct(
++                vec![Arc::new(arrow_schema::Field::new("l", DataType::Int64, false))].into(),
++            ),
++            false,
++        )]));
++        let config = DeltaScanConfig::default().with_schema(override_schema.clone());
++        let scan_plan = KernelScanPlan::try_new(snapshot, None, &[], &config, None)?;
++        println!("scan_schema:         {:?}", scan_plan.contract.scan_schema);
++        println!("parquet_read_schema: {:?}", scan_plan.parquet_read_schema);
++        assert_eq!(scan_plan.contract.scan_schema, override_schema);
++        assert_eq!(scan_plan.parquet_read_schema, override_schema);
++        Ok(())
++    }
+ }
