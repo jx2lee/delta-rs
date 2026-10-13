@@ -30,7 +30,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::execution::context::{SessionContext, SessionState};
-use delta_kernel::expressions::Scalar;
+use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
 use futures::future::BoxFuture;
@@ -775,7 +775,8 @@ impl MergePlan {
             .columns
             .iter()
             .map(|col_name| {
-                let mut segments = col_name.split('.');
+                let path = parse_zorder_column(col_name);
+                let mut segments = path.iter();
                 let first = segments.next().expect("column name cannot be empty");
                 let mut expr = ident(first);
                 for segment in segments {
@@ -1282,10 +1283,20 @@ async fn build_compaction_plan(
     ))
 }
 
+/// Split one z-order column spec into its path. Backtick-escaped names (`` `a.b` ``) are a single
+/// field; anything the kernel parser rejects (hyphens, spaces, ...) keeps the legacy dot split.
+fn parse_zorder_column(column: &str) -> Vec<String> {
+    match ColumnName::parse_column_name_list(column).as_deref() {
+        Ok([name]) => name.path().to_vec(),
+        _ => column.split('.').map(str::to_owned).collect(),
+    }
+}
+
 /// Validates that a z-order column path exists in the schema, supporting nested
 /// struct fields via dot notation (e.g., "meta.field_a").
 fn validate_zorder_column(schema: &StructType, column: &str) -> Result<(), DeltaTableError> {
-    let mut segments = column.split('.').peekable();
+    let path = parse_zorder_column(column);
+    let mut segments = path.iter().map(String::as_str).peekable();
     let mut current_struct = schema;
     while let Some(segment) = segments.next() {
         let field = current_struct.field(segment).ok_or_else(|| {
@@ -1486,6 +1497,18 @@ mod compact_planner_tests {
         let err = crate::protocol::DeltaOperation::try_from(input).unwrap_err();
         assert!(err.to_string().contains("optimize target_size"));
         assert!(err.to_string().contains("i64::MAX"));
+    }
+
+    #[test]
+    fn test_parse_zorder_column() {
+        // plain nested path
+        assert_eq!(parse_zorder_column("a.b"), vec!["a", "b"]);
+        // backtick-escaped: one field whose name contains a dot
+        assert_eq!(parse_zorder_column("`a.b`"), vec!["a.b"]);
+        assert_eq!(parse_zorder_column("a.`b.c`"), vec!["a", "b.c"]);
+        // kernal parser rejects these; legacy split keeps old behaviour
+        assert_eq!(parse_zorder_column("non-existent"), vec!["non-existent"]);
+        assert_eq!(parse_zorder_column("my col.sub"), vec!["my col", "sub"]);
     }
 }
 

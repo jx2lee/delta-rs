@@ -2067,6 +2067,41 @@ async fn test_zorder_nested_columns() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn test_zorder_backtick() -> Result<(), Box<dyn Error>> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("a.b", ArrowDataType::Int32, true),
+        Field::new(
+            "n",
+            ArrowDataType::Struct(Fields::from(vec![Field::new(
+                "a",
+                ArrowDataType::Int32,
+                true,
+            )])),
+            true,
+        ),
+    ]));
+    let n = arrow_array::StructArray::from(vec![(
+        Arc::new(Field::new("a", ArrowDataType::Int32, true)),
+        Arc::new(Int32Array::from(vec![3, 2, 1])) as ArrayRef,
+    )]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(n)],
+    )?;
+    let table = DeltaTable::new_in_memory().write(vec![batch]).await?;
+
+    let mut t = DeltaTable::new(table.log_store());
+    t.load().await?;
+    let (_, m) = t
+        .optimize()
+        .with_type(OptimizeType::ZOrder(vec!["`a.b`".into()]))
+        .await?;
+    assert_eq!(m.num_files_added, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_zorder_rejects_invalid_nested_path() -> Result<(), Box<dyn Error>> {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new(
