@@ -7,7 +7,7 @@
 | # | 폴더 | 이슈 | 난이도 | 재현 방식 | 비고 |
 |---|---|---|---|---|---|
 | 1 | `unity-catalog-null-expiration-time` | #3966 | ★ | serde 단위 테스트 실패 확인 | 필드 하나 Option 화. PR #4884 올림 |
-| 2 | `unity-catalog-unknown-enum-values` | #3997 | ★ | serde 단위 테스트 실패 확인 | enum 에 `#[serde(other)]` |
+| 2 | `unity-catalog-unknown-enum-values` | #3997 | ★ | serde 단위 테스트 실패 확인 | enum 에 `#[serde(other)]`. PR 4885 올림 |
 | 3 | `uniform-table-properties-rejected` | #3299 | ★★ | in-memory create 로 에러 재현 | enum variant + writer feature |
 | 4 | `zorder-dotted-column-names` | #4363 | ★★ | in-memory z-order 로 에러 재현 | kernel `ColumnName` 파서 사용. 이전 `take` 있음 |
 | 5 | `compaction-ordered-buffer-delays-commits` | #4749 | ★★ | 코드·git 이력 대조 | 1줄 fix 가능하나 먼저 이슈에 방향 질문 |

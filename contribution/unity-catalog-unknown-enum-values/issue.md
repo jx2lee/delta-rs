@@ -1,7 +1,7 @@
 # [Bug]: unity catalog request GetTableResponse error
 
 - Issue: https://github.com/delta-io/delta-rs/issues/3997 (opened 2025-12-18, labels bug, binding/rust, unity-catalog)
-- Linked PR: none (checked 2026-10-13)
+- Linked PR: PR 4885 (open, opened 2026-10-15) — covers `TableType` / `DataSourceFormat` only
 - Verified against main `b597cf23`
 
 ## Summary
