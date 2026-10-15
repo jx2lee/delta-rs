@@ -1,4 +1,6 @@
-Branch: `fix/unity-tolerant-table-models`
+- PR: delta-io/delta-rs PR 4885 (opened 2026-10-15, open, no reviews; DCO / semantic-release checks pass)
+- Branch: `jx2lee/fix/unity-tolerant-table-models` (commit `4a369ee4`)
+- Commit message: `fix(catalog-unity): tolerate unknown enum values in table responses`
 
 Title:
 
@@ -6,22 +8,20 @@ Title:
 fix(catalog-unity): tolerate unknown enum values in table responses
 ```
 
-Body:
+Body (as posted):
 
-```markdown
+````markdown
 # Description
 
-`GetTableResponse` is an untagged enum, so any field of `Table` that fails to decode is reported as
-`data did not match any variant of untagged enum GetTableResponse`. The table models are strict:
-`TableType`, `ColumnTypeName` and `DataSourceFormat` reject values Databricks has added since they were
-written (`FOREIGN`, `VARIANT`, `GEOGRAPHY`, `ICEBERG`, ...), and `Table.properties` is required although
-it is omitted when empty.
+`GetTableResponse` and `ListTableSummariesResponse` are untagged enums, so any field that fails to
+decode is reported as `data did not match any variant of untagged enum ...`. `TableType` and
+`DataSourceFormat` reject values Databricks has added since they were written (e.g. `FOREIGN`,
+`METRIC_VIEW`), which makes the whole request fail.
 
-- Add the currently documented values to the three enums and an `#[serde(other)] Unknown` variant so
-  future additions degrade gracefully instead of failing the whole request.
-- Default `Table.properties` to an empty map.
-- Decode the success case first and include the serde error in the returned error so users see which
-  field failed.
+- Add the currently documented `TableType` values: `FOREIGN`, `EXTERNAL_SHALLOW_CLONE`,
+  `MANAGED_SHALLOW_CLONE`, `METRIC_VIEW`.
+- Make the existing `Undefined` variant of `TableType` and `DataSourceFormat` the `#[serde(other)]`
+  fallback, so values this crate doesn't know yet decode to `Undefined` instead of failing.
 
 # Related Issue(s)
 
@@ -30,7 +30,11 @@ it is omitted when empty.
 # Documentation
 
 - https://docs.databricks.com/api/workspace/tables/get
-```
+````
+
+Not in this PR (left as possible follow-ups): `ColumnTypeName` still lacks `VARIANT` / `GEOGRAPHY` /
+`GEOMETRY`, `Table.properties` still has no `#[serde(default)]`, and the opaque untagged-enum error
+message is unchanged.
 
 Checklist: `cargo fmt --all`, `cargo clippy -p deltalake-catalog-unity --tests`,
 `cargo test -p deltalake-catalog-unity`, `git commit -s`.

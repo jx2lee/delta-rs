@@ -25,15 +25,17 @@ Rust/serde 개념 메모:
 - `#[serde(untagged)]` 는 variant 를 순서대로 시도하고 모두 실패하면 위의 뭉뚱그린 메시지를 냅니다. 실제 serde 에러를 보려면 `Table` 을 직접 디코딩해야 합니다.
 - `#[serde(default)]` 는 필드가 없을 때 `Default::default()`(HashMap 이면 빈 맵).
 
-## 3. 수정
+## 3. 수정 (실제로 올린 내용)
 
-### 3-1. enum 세 개에 알려진 값 + `Unknown`
+새 `Unknown` variant 를 만들지 않고, 이미 있던 `Undefined` 를 `#[serde(other)]` fallback 으로 썼습니다.
+`#[serde(other)]` 는 마지막 variant 에만 붙일 수 있어서 `Undefined` 를 enum 맨 끝으로 옮겼습니다.
+
+### 3-1. `TableType`
 
 ```rust
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TableType {
-    Undefined,
+-   #[default]
+-   Undefined,
     Managed,
     External,
     View,
@@ -43,51 +45,52 @@ pub enum TableType {
 +   ExternalShallowClone,
 +   ManagedShallowClone,
 +   MetricView,
-+   /// Any value this crate does not know yet.
++   /// Unspecified or any value this crate does not know yet
++   #[default]
 +   #[serde(other)]
-+   Unknown,
++   Undefined,
 }
 ```
 
-`ColumnTypeName` 에 `Variant, Geography, Geometry, #[serde(other)] Unknown`,
-`DataSourceFormat` 에 Databricks 문서의 최신 목록(`Iceberg`, `DeltaUniformIceberg`, `TeradataFormat`, `OracleFormat`, `SapFormat` 등 — 문서 확인) 과 `#[serde(other)] Unknown`.
+`impl Display for TableType` 의 `match` 에 새 variant 네 개의 가지도 추가했습니다(빠지면 컴파일러가 알려 줍니다).
 
-`TableType` 은 `Display`/`match` 구현이 있을 수 있습니다(315-327 줄). variant 를 추가하면 컴파일러가 빠진 `match` 가지를 알려주므로 그때 채우면 됩니다.
+### 3-2. `DataSourceFormat`
 
-### 3-2. `Table.properties`
+값은 추가하지 않고 `Undefined` 만 맨 끝으로 옮겨 같은 doc 주석과 `#[default]` + `#[serde(other)]` 를 붙였습니다.
 
-```rust
--    #[serde(skip_serializing_if = "HashMap::is_empty")]
-+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-     pub properties: HashMap<String, String>,
-```
+### 3-3. 이번 PR 에서 하지 않은 것
 
-### 3-3. (선택) 에러 메시지 개선
+- `ColumnTypeName` 의 `VARIANT`/`GEOGRAPHY`/`GEOMETRY` (이 enum 은 `Copy` 이고 `Undefined` 가 없음)
+- `Table.properties` 의 `#[serde(default)]`
+- untagged enum 의 뭉뚱그린 에러 메시지 개선
 
-`lib.rs` 의 `get_table` 에서 `resp.json::<GetTableResponse>()` 대신
-본문을 `text()` 로 받은 뒤 `serde_json::from_str::<Table>` → 실패 시 `ErrorResponse` 시도 → 둘 다 실패면
-`Table` 의 serde 에러를 메시지에 포함해 돌려줍니다. 이 부분은 PR 범위를 키우니 리뷰어가 원하면 별도 PR 로 떼도 됩니다.
+리뷰에서 요청이 오거나 PR 이 머지되면 후속 PR 로 다룰 수 있습니다.
 
 ## 4. 테스트 (`models.rs` tests 모듈)
 
 ```rust
 #[test]
-fn get_table_response_accepts_new_enum_values() {
-    let body = r#"{"name":"t","catalog_name":"c","schema_name":"s","table_type":"FOREIGN",
-        "data_source_format":"DELTA","columns":[{"name":"v","position":0,"nullable":true,"type_name":"VARIANT"}],
-        "storage_location":"s3://b/t","created_at":1,"updated_at":1,"table_id":"id"}"#;
-    match serde_json::from_str::<GetTableResponse>(body).unwrap() {
-        GetTableResponse::Success(t) => {
-            assert_eq!(t.table_type, TableType::Foreign);
-            assert_eq!(t.columns[0].type_name, Some(ColumnTypeName::Variant));
-            assert!(t.properties.is_empty());
-        }
-        other => panic!("unexpected {other:?}"),
-    }
+fn test_unknown_enum_values_fall_back_to_undefined() {
+    let resp: ListTableSummariesResponse = serde_json::from_str(
+        r#"{"tables": [{"full_name": "c.s.t", "table_type": "SOMETHING_NEW"}]}"#,
+    )
+    .unwrap();
+    let ListTableSummariesResponse::Success { tables, .. } = resp else {
+        panic!("expected Success, got {resp:?}");
+    };
+    assert_eq!(tables[0].table_type, TableType::Undefined);
+
+    let body = GET_TABLE_RESPONSE.replace(r#""DELTA""#, r#""SOMETHING_NEW""#);
+    let GetTableResponse::Success(t) = serde_json::from_str(&body).unwrap() else {
+        panic!("expected Success");
+    };
+    assert_eq!(t.data_source_format, Some(DataSourceFormat::Undefined));
 }
 ```
 
-수정 전에는 `unwrap()` 에서 패닉(2026-10-13 재현), 수정 후 통과.
+기존 테스트용 상수 `GET_TABLE_RESPONSE` 에서 `"DELTA"` 만 모르는 값으로 바꿔 `DataSourceFormat` 을 확인하고,
+`ListTableSummariesResponse` 로 `TableType` 을 확인합니다. 수정 전에는 두 응답 모두 untagged enum 의 어느 variant 에도
+맞지 않아 `unwrap()` 에서 패닉합니다.
 
 ## 5. 실행
 
@@ -98,7 +101,12 @@ cargo test -p deltalake-catalog-unity
 git commit -s -m "fix(catalog-unity): tolerate unknown enum values in table responses"
 ```
 
-## 6. 주의
+## 6. 진행 상황
 
-- 이슈에 응답 본문이 없으니 PR 본문에 "재현은 serde 단위 테스트로 했고, 실제 어떤 값이 문제였는지는 보고자에게 확인 요청" 이라고 솔직히 적으세요. 이슈에 먼저 "`VARIANT` 컬럼이나 `FOREIGN` 테이블이냐" 고 물어보면 더 좋습니다.
-- `#3966`(같은 crate, `expiration_time`) 과 묶지 말고 PR 을 분리하세요. 리뷰가 빨라집니다.
+- 브랜치 `jx2lee/fix/unity-tolerant-table-models`, 커밋 `4a369ee4`
+- PR 4885 (2026-10-15 올림, open, 리뷰 대기). DCO·semantic-release 체크 통과
+
+## 7. 주의
+
+- `#3966`(같은 crate, `expiration_time`) 과는 PR 을 분리했습니다(PR 4884).
+- 이슈에 응답 본문이 없어 실제로 어떤 값이 문제였는지는 모릅니다. 보고자 응답이 `VARIANT` 컬럼 때문이라면 3-3 의 후속 작업이 필요합니다.
