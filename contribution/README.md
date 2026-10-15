@@ -1,6 +1,6 @@
 # delta-rs 기여 후보 (2026-10-13, main `b597cf23`)
 
-조건: GitHub 에 등록된 **open issue** 이고, 링크된 open/merged PR 이 없으며, 소스에서 원인을 확인하고 재현한 것.
+조건: GitHub 에 등록된 **open issue** 이고(6번만 예외: 직접 찾은 버그라 이슈부터 올려야 함), 링크된 open/merged PR 이 없으며, 소스에서 원인을 확인하고 재현한 것.
 각 폴더에 `issue.md`(이슈 요약·재현 결과), `pr.md`(브랜치·제목·본문 초안), `guide.md`(수정 방법, Rust 초심자용) 가 있습니다.
 `_repro/` 에는 재현에 실제로 쓴 테스트 코드가 있습니다(저장소에서는 되돌렸음).
 
@@ -11,6 +11,7 @@
 | 3 | `zorder-dotted-column-names` | #4363 | ★★ | in-memory z-order 로 에러 재현 | kernel `ColumnName` 파서 사용. 이전 `take` 있음 |
 | 4 | `compaction-ordered-buffer-delays-commits` | #4749 | ★★ | 코드·git 이력 대조 | 1줄 fix 가능하나 먼저 이슈에 방향 질문 |
 | 5 | `nested-schema-override-widened-in-parquet-read` | #4678 | ★★★★ | `plan.rs` 단위 테스트 실패 확인 | 닫힌 PR 2개의 리뷰 코멘트 반영 필요 |
+| 6 | `optimize-tilde-partition-missing-files` | 미등록 | ★ | Python·Rust 로 main 에서 재현, 수정안 검증 | 파티션 값에 `~` → optimize 실패. 이슈 먼저 올릴 것 |
 
 ## 해결됨 (done/)
 
@@ -28,6 +29,7 @@
 - #3906(DynamoDB), #4628(UC 토큰 갱신), #3203, #3852, #4401, #3991/#3951(Azure), #2425/#3551(Windows): 외부 환경 없이는 재현 불가.
 - #4523/#4521: `ai` 라벨의 메모리 사용량 이슈, 측정 환경 필요.
 - #2001: 이미 해결됨, close 요청만.
+- #2146 경로 인코딩 테스트 확대: 범위가 정해지지 않은 umbrella 이슈. 같은 방향의 #4815 도 큰 리팩터링 제안이라 제외. 특수문자 파티션 값으로 write/read/optimize/vacuum/DML/checkpoint 를 돌려 본 결과 새로 찾은 버그는 6번 하나(vacuum 은 #4646·PR #4658, CDF 는 #4842·PR #4843 에서 이미 진행 중).
 - #4864 parquet `metadata_size_hint` 미적용: #4870 으로 해결·이슈 close 됨 → 폴더 삭제.
 
 ## 공통 주의
