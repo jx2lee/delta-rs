@@ -1,7 +1,7 @@
 # [Bug]: Error when reading table from local OSS Unity Catalog
 
 - Issue: https://github.com/delta-io/delta-rs/issues/3966 (opened 2025-12-05, labels bug, binding/rust, unity-catalog)
-- Linked PR: none (checked 2026-10-13)
+- Linked PR: https://github.com/delta-io/delta-rs/pull/4884 (opened 2026-10-15, open, no review yet)
 - Verified against main `b597cf23`
 
 ## Summary
@@ -30,7 +30,8 @@ timestamp fails to decode. The only consumer is `crates/catalog-unity/src/datafu
 (`TokenExpiry::expire_after_read`), which computes `expiration_time - Utc::now()` for the credential
 cache TTL.
 
-## Repro (serde unit test, see guide.md)
+## Repro (serde unit test `test_temp_credentials_without_expiration_time`, see guide.md)
 
-Deserialising `{"expiration_time": null, "url": "file:///tmp/t"}` and `{"url": "file:///tmp/t"}`
-into `TemporaryTableCredentials` fails; the same body with a numeric `expiration_time` succeeds.
+Deserialising `{"expiration_time":null, "url":"file:///tmp/t"}` and `{"url":"file:///tmp/t"}`
+into `TableTempCredentialsResponse` fails (neither the `Success` nor the `Error` variant matches); the
+same body with a numeric `expiration_time` decodes as `Success`.

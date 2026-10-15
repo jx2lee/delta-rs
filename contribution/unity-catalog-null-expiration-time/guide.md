@@ -25,7 +25,7 @@ Rust 개념 메모:
 ```rust
 -    #[serde(with = "chrono::serde::ts_milliseconds")]
 -    pub expiration_time: DateTime<Utc>,
-+    /// `None` when the catalog does not vend an expiry (the OSS server returns `null`).
++    /// `None` when the catalog does not vend an expiry (OSS UC returns `null`).
 +    #[serde(default, with = "chrono::serde::ts_milliseconds_option")]
 +    pub expiration_time: Option<DateTime<Utc>>,
 ```
@@ -38,14 +38,14 @@ Rust 개념 메모:
 -        time_to_expire.to_std().ok()
 +        let Some(expiration_time) = value.expiration_time else {
 +            tracing::info!("Token {_key} has no expiry; keeping it until evicted");
-+            return None;   // moka: None = 만료 없음
++            return None;
 +        };
 +        let time_to_expire = expiration_time - Utc::now();
 +        tracing::info!("Token {_key} expires in {time_to_expire}");
 +        time_to_expire.to_std().ok()
 ```
 
-`let ... else` 는 패턴이 안 맞으면 else 블록(반드시 return/continue 등으로 끝나야 함)을 실행하는 문법입니다.
+moka 의 `Expiry` 에서 `None` 을 돌려주면 만료 시간이 없다는 뜻입니다. `let ... else` 는 패턴이 안 맞으면 else 블록(반드시 return/continue 등으로 끝나야 함)을 실행하는 문법입니다.
 
 컴파일러가 `expiration_time` 을 쓰는 다른 곳이 있으면 에러로 알려줍니다. 2026-10-13 기준으로는 위 한 곳뿐입니다.
 
@@ -53,22 +53,33 @@ Rust 개념 메모:
 
 ```rust
 #[test]
-fn temporary_credentials_accept_null_expiration_time() {
-    let body = r#"{"aws_temp_credentials":null,"expiration_time":null,"url":"file:///tmp/t"}"#;
-    let creds: TemporaryTableCredentials = serde_json::from_str(body).unwrap();
-    assert!(creds.expiration_time.is_none());
+fn test_temp_credentials_without_expiration_time() {
+    // OSS Unity Catalog returns empty credential for file:// tables (#3966)
+    for body in [
+        r#"{"expiration_time":null, "url":"file:///tmp/t"}"#,
+        r#"{"url":"file:///tmp/t"}"#,
+    ] {
+        let resp: TableTempCredentialsResponse = serde_json::from_str(body).unwrap();
+        let TableTempCredentialsResponse::Success(creds) = resp else {
+            panic!("expected Success, got {resp:?}");
+        };
+        assert!(creds.expiration_time.is_none());
+    }
 
-    let body = r#"{"url":"file:///tmp/t"}"#;
-    let creds: TemporaryTableCredentials = serde_json::from_str(body).unwrap();
-    assert!(creds.expiration_time.is_none());
-
-    let body = r#"{"expiration_time":1765000000000,"url":"file:///tmp/t"}"#;
-    let creds: TemporaryTableCredentials = serde_json::from_str(body).unwrap();
-    assert!(creds.expiration_time.is_some());
+    let resp: TableTempCredentialsResponse =
+        serde_json::from_str(r#"{"expiration_time":1765000000000, "url":"file:///tmp/t"}"#)
+            .unwrap();
+    assert!(matches!(
+        resp,
+        TableTempCredentialsResponse::Success(TemporaryTableCredentials {
+            expiration_time: Some(_),
+            ..
+        })
+    ));
 }
 ```
 
-수정 전에는 앞의 두 `unwrap()` 이 패닉(=재현), 수정 후 통과.
+구조체가 아니라 실제 HTTP 응답을 받는 `TableTempCredentialsResponse`(untagged enum `Success | Error`)로 역직렬화합니다. `Error` 변형인 `ErrorResponse` 는 `error_code`, `message` 가 필수라서 수정 전에는 두 변형 모두 맞지 않고 루프 안의 `unwrap()` 이 패닉합니다(=재현). 수정 후에는 `Success` 로 디코딩되어 통과합니다.
 
 ## 5. 실행
 
@@ -76,10 +87,15 @@ fn temporary_credentials_accept_null_expiration_time() {
 cargo fmt --all
 cargo clippy -p deltalake-catalog-unity --tests
 cargo test -p deltalake-catalog-unity
-git commit -s -m "fix(catalog-unity): accept null expiration_time in temporary credentials"
+git commit -s -m "fix: use option \`expiration_time\` for oss-uc"
 ```
 
-## 6. 주의
+## 6. 진행 상황
+
+- 브랜치 `jx2lee/fix/oss-uc-null-expiration-time`, 커밋 `548fb50e`
+- PR: https://github.com/delta-io/delta-rs/pull/4884 (2026-10-15 생성, open). PR 제목은 `fix(catalog-unity): accept null expiration_time in temporary credentials` 이고 DCO·semantic-release 체크는 통과했습니다. 리뷰는 아직 없습니다.
+
+## 7. 주의
 
 - 같은 crate 의 `MissingCredential` 관련 PR(#4437) 은 "전부 AI 생성" 으로 거절됐습니다. 이 PR 은 이슈 작성자가 원인을 이미 지목했고 수정이 작으니, 본문에 OSS 스펙 링크와 테스트를 넣고 짧게 유지하세요.
 - 이 crate 는 `deltalake-core` 와 별도 버전이라 CHANGELOG 수정은 필요 없습니다.
