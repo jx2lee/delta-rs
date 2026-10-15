@@ -1,3 +1,5 @@
+> 해결됨: PR 4884 머지, upstream main `3604f18a` (2026-10-15) 에 반영. 이슈도 close(completed).
+
 # [Bug]: Error when reading table from local OSS Unity Catalog
 
 - Issue: https://github.com/delta-io/delta-rs/issues/3966 (opened 2025-12-05, labels bug, binding/rust, unity-catalog)
