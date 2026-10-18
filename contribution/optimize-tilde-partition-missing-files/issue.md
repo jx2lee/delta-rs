@@ -10,7 +10,7 @@
 
 ## Summary
 
-`optimize` passes the files of each bin to the scan as a `FileSelection` (`optimize.rs:745` compact, `:769` z-order;
+`optimize` passes the files of each bin to the scan as a `FileSelection` (`optimize.rs:747` compact, `:771` z-order;
 only compact was run, z-order goes through the same `provider_for`).
 `FileSelection::from_adds` turns each `Add.path` (already percent-*decoded*) into an id with
 `String::from(Path::from(path))` (`crates/core/src/delta_datafusion/table_provider/next/mod.rs:236`).

@@ -1,4 +1,4 @@
-- PR: delta-io/delta-rs PR 4885 (opened 2026-10-15, open, no reviews; DCO / semantic-release checks pass)
+- PR: delta-io/delta-rs PR 4885 (opened 2026-10-15, merged as `2b656390` on 2026-10-15; DCO / semantic-release checks passed; closes #3997)
 - Branch: `jx2lee/fix/unity-tolerant-table-models` (commit `4a369ee4`)
 - Commit message: `fix(catalog-unity): tolerate unknown enum values in table responses`
 

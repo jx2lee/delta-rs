@@ -1,4 +1,4 @@
-- PR: https://github.com/delta-io/delta-rs/pull/4884 (opened 2026-10-15, open)
+- PR: https://github.com/delta-io/delta-rs/pull/4884 (opened 2026-10-15, merged as `3604f18a` on 2026-10-15; closes #3966)
 - Branch: `jx2lee/fix/oss-uc-null-expiration-time` (commit `548fb50e`)
 - Commit message: ``fix: use option `expiration_time` for oss-uc``
 

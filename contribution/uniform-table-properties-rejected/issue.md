@@ -20,7 +20,7 @@ The same happens with `dt.alter.set_table_properties(...)`.
 
 - `crates/core/src/table/config.rs:18` `TableProperty` is delta-rs' own allow-list of known `delta.*`
   keys. It has no variant for `delta.enableIcebergCompatV1/V2/V3` or `delta.universalFormat.enabledFormats`.
-- `crates/core/src/kernel/models/actions.rs:472-481` `apply_properties_to_protocol` parses every key
+- `crates/core/src/kernel/models/actions.rs:467-481` `apply_properties_to_protocol` parses every key
   with `key.parse::<TableProperty>()`; an unknown key with `raise_if_not_exists = true` (the default
   for `create` and `set_table_properties`) returns the error above.
 - `delta_kernel` already knows the keys (`kernel/src/table_properties/mod.rs:44-46`
@@ -28,7 +28,7 @@ The same happens with `dt.alter.set_table_properties(...)`.
   at `actions.rs:372`).
 
 Workaround users can use today: `raise_if_key_not_exists=False` on create. That skips the error but
-also does not set the `icebergCompatV2` writer feature that the protocol requires.
+also does not set the `icebergCompatV2` writer feature, so per the protocol the feature is not active.
 
 ## Repro (Rust, run 2026-10-13)
 

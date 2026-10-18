@@ -5,7 +5,7 @@
 ## 1. 문제를 한 줄로
 
 `"a.b"` 를 받으면 무조건 `["a","b"]` 로 쪼개서 중첩 경로로 해석합니다. 이름 자체가 `a.b` 인 컬럼은 영원히 못 찾습니다.
-kernel 에 백틱 이스케이프를 이해하는 파서가 이미 있으니 그걸 쓰면 됩니다.
+kernel 에 백틱 이스케이프를 처리하는 파서가 이미 있으니 그걸 가져다 쓰면 됩니다.
 
 ## 2. 코드 읽기
 
@@ -14,7 +14,7 @@ kernel 에 백틱 이스케이프를 이해하는 파서가 이미 있으니 그
 | `crates/core/src/operations/optimize.rs` | 762-800 | `read_zorder`: `col_name.split('.')` → `ident(first).field(seg)...` DataFusion 식 생성 |
 | 같은 파일 | 1285-1308 | `validate_zorder_column`: `split('.')` 로 스키마 검증 |
 | 같은 파일 | 1310-1333 | `build_zorder_plan`: 파티션 컬럼 검사 후 validate 호출 |
-| kernel `src/expressions/column_names.rs` | 38-60, 93 | `ColumnName::parse_column_name_list`, `.path() -> &[String]` |
+| kernel `src/expressions/column_names.rs` | 53, 93 | `ColumnName::parse_column_name_list`, `.path() -> &[String]` |
 | `crates/core/src/delta_datafusion/data_validation.rs` | 42, 352 | delta-rs 안에서 `ColumnName` 을 이미 쓰는 예 |
 
 Rust 개념 메모:
@@ -72,11 +72,11 @@ fn parse_zorder_column(column: &str) -> Result<Vec<String>, DeltaTableError> {
 ```
 
 `collect::<Result<Vec<_>, _>>()` 는 "하나라도 Err 면 전체 Err" 로 모아 주는 관용구입니다.
-`validate_zorder_column` 이 먼저 돌기 때문에 여기서 실제로 실패할 일은 거의 없지만 `expect` 로 패닉을 만들지 않는 편이 리뷰에 유리합니다.
+`validate_zorder_column` 이 먼저 돌아서 여기서 실제로 실패할 일은 거의 없습니다. 그래서 `expect` 를 남기되, 메시지에 왜 실패하지 않는지 적어 둡니다.
 
-### 3-4. 파티션 컬럼 검사 (1317-1325)
+### 3-4. 파티션 컬럼 검사 (1322-1330)
 
-`partition_keys.contains(col)` 는 raw 문자열 비교입니다. `parse_zorder_column(col)?` 의 첫 세그먼트가 파티션 키인지로 바꾸면 ``` `a.b` ``` 같은 입력도 올바르게 걸러집니다. 작은 변경이라 같은 PR 에 넣어도 됩니다.
+`partition_keys.contains(col)` 는 raw 문자열 비교입니다. `parse_zorder_column(col)?` 의 첫 세그먼트가 파티션 키인지로 바꾸면 ``` `a.b` ``` 같은 입력도 제대로 걸러집니다. 변경이 작으니 같은 PR 에 넣어도 됩니다.
 
 ## 4. 테스트
 
@@ -101,7 +101,7 @@ let (_, m) = t.optimize().with_type(OptimizeType::ZOrder(vec!["`a.b`".into()])).
 assert_eq!(m.num_files_added, 1);
 ```
 
-`validate_zorder_column` 단위 테스트도 1385 줄 근처 `mod tests` 에 두 줄짜리로 추가하면 좋습니다.
+`validate_zorder_column` 단위 테스트도 1380 줄의 `#[cfg(test)]` 모듈(`compact_planner_tests`) 근처에 두 줄 정도로 추가하면 좋습니다.
 
 ## 5. 실행
 
@@ -115,4 +115,4 @@ git commit -s -m "feat: parse z-order columns with kernel ColumnName semantics"
 ## 6. 주의
 
 - 이슈에 `take` 가 이미 한 번 있었습니다. 댓글로 "진행 중인 작업이 없으면 제가 하겠다" 고 먼저 남기세요.
-- Python 바인딩(`python/deltalake/table.py` 의 `z_order(columns: Iterable[str])`) 은 문자열을 그대로 넘기므로 변경 없이 백틱 문법이 따라옵니다. docstring 에 한 줄 추가하면 친절합니다.
+- Python 바인딩(`python/deltalake/table.py` 의 `z_order(columns: Iterable[str])`) 은 문자열을 그대로 넘기므로 변경 없이 백틱 문법이 따라옵니다. docstring 에 한 줄 덧붙여 두면 좋습니다.

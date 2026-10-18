@@ -1,7 +1,9 @@
+> 해결됨: PR 4885 머지, upstream main `2b656390` (2026-10-15) 에 반영. 이슈도 close.
+
 # [Bug]: unity catalog request GetTableResponse error
 
 - Issue: https://github.com/delta-io/delta-rs/issues/3997 (opened 2025-12-18, labels bug, binding/rust, unity-catalog)
-- Linked PR: PR 4885 (open, opened 2026-10-15) — covers `TableType` / `DataSourceFormat` only
+- Linked PR: PR 4885 (opened 2026-10-15, merged as `2b656390` on 2026-10-15) — covers `TableType` / `DataSourceFormat` only
 - Verified against main `b597cf23`
 
 ## Summary

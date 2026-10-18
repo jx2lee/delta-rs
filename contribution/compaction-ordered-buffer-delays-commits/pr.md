@@ -42,7 +42,7 @@ fix: commit buffered optimize actions when min_commit_interval elapses
 ```
 
 Body: as above, but explain that the commit loop now selects between `stream.next()` and a
-`tokio::time::sleep(min_commit_interval)` tick so buffered actions are flushed even while the
+`tokio::time::interval(min_commit_interval)` tick so buffered actions are flushed even while the
 stream is blocked on a slow bin.
 
 Checklist: `cargo fmt --all`, `cargo clippy -p deltalake-core --features datafusion --tests`,

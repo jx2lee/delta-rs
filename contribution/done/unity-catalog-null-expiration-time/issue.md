@@ -3,7 +3,7 @@
 # [Bug]: Error when reading table from local OSS Unity Catalog
 
 - Issue: https://github.com/delta-io/delta-rs/issues/3966 (opened 2025-12-05, labels bug, binding/rust, unity-catalog)
-- Linked PR: https://github.com/delta-io/delta-rs/pull/4884 (opened 2026-10-15, open, no review yet)
+- Linked PR: https://github.com/delta-io/delta-rs/pull/4884 (opened 2026-10-15, merged as `3604f18a` on 2026-10-15)
 - Verified against main `b597cf23`
 
 ## Summary

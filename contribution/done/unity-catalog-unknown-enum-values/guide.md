@@ -1,11 +1,13 @@
 # 수정 가이드: Databricks 응답의 새 enum 값 때문에 GetTableResponse 디코딩 실패 (#3997)
 
+결과: PR 4885 머지(`2b656390`, 2026-10-15), 이슈 #3997 close
+
 난이도: ★☆☆☆☆ (serde attribute 추가. Rust 로직 변경은 거의 없음)
 
 ## 1. 문제를 한 줄로
 
-응답 모델의 enum 이 "아는 값" 만 받습니다. Databricks 가 새 값(`VARIANT` 컬럼, `FOREIGN` 테이블 등)을 돌려주면
-전체 응답이 실패하고, untagged enum 때문에 에러 메시지는 원인을 숨깁니다.
+응답 모델의 enum 은 "아는 값" 만 받습니다. Databricks 가 새 값(`VARIANT` 컬럼, `FOREIGN` 테이블 등)을 돌려주면
+응답 전체가 실패하고, untagged enum 이라 에러 메시지에 원인이 드러나지 않습니다.
 
 ## 2. 코드 읽기 (`crates/catalog-unity/src/models.rs`)
 
@@ -18,12 +20,12 @@
 | 402-425 | `ColumnTypeName` |
 | 604- | 기존 테스트 모듈 (여기에 테스트 추가) |
 
-`crates/catalog-unity/src/lib.rs` 에서 `GetTableResponse` 를 쓰는 곳(`get_table` 검색)도 봐 두세요.
+`GetTableResponse` 를 쓰는 곳은 `crates/catalog-unity/src/lib.rs` 의 `get_table` 입니다.
 
 Rust/serde 개념 메모:
 - `#[serde(other)]` 를 **unit variant** 하나에 붙이면 모르는 문자열이 모두 그 variant 로 들어갑니다. (`rename_all` 과 같이 써도 됩니다.)
 - `#[serde(untagged)]` 는 variant 를 순서대로 시도하고 모두 실패하면 위의 뭉뚱그린 메시지를 냅니다. 실제 serde 에러를 보려면 `Table` 을 직접 디코딩해야 합니다.
-- `#[serde(default)]` 는 필드가 없을 때 `Default::default()`(HashMap 이면 빈 맵).
+- `#[serde(default)]` 는 필드가 없을 때 `Default::default()`(HashMap 이면 빈 맵) 를 넣습니다.
 
 ## 3. 수정 (실제로 올린 내용)
 
@@ -64,7 +66,7 @@ pub enum TableType {
 - `Table.properties` 의 `#[serde(default)]`
 - untagged enum 의 뭉뚱그린 에러 메시지 개선
 
-리뷰에서 요청이 오거나 PR 이 머지되면 후속 PR 로 다룰 수 있습니다.
+셋 다 후속 PR 후보로 남겼습니다.
 
 ## 4. 테스트 (`models.rs` tests 모듈)
 
@@ -90,7 +92,7 @@ fn test_unknown_enum_values_fall_back_to_undefined() {
 
 기존 테스트용 상수 `GET_TABLE_RESPONSE` 에서 `"DELTA"` 만 모르는 값으로 바꿔 `DataSourceFormat` 을 확인하고,
 `ListTableSummariesResponse` 로 `TableType` 을 확인합니다. 수정 전에는 두 응답 모두 untagged enum 의 어느 variant 에도
-맞지 않아 `unwrap()` 에서 패닉합니다.
+맞지 않아 `unwrap()` 이 패닉합니다.
 
 ## 5. 실행
 
@@ -104,9 +106,9 @@ git commit -s -m "fix(catalog-unity): tolerate unknown enum values in table resp
 ## 6. 진행 상황
 
 - 브랜치 `jx2lee/fix/unity-tolerant-table-models`, 커밋 `4a369ee4`
-- PR 4885 (2026-10-15 올림, open, 리뷰 대기). DCO·semantic-release 체크 통과
+- PR 4885 (2026-10-15 올림, 같은 날 `2b656390` 로 머지). DCO·semantic-release 체크 통과
 
 ## 7. 주의
 
 - `#3966`(같은 crate, `expiration_time`) 과는 PR 을 분리했습니다(PR 4884).
-- 이슈에 응답 본문이 없어 실제로 어떤 값이 문제였는지는 모릅니다. 보고자 응답이 `VARIANT` 컬럼 때문이라면 3-3 의 후속 작업이 필요합니다.
+- 이슈에 응답 본문이 없어 실제로 어떤 값이 문제였는지는 모릅니다. 보고자 응답이 `VARIANT` 컬럼 때문이었다면 3-3 의 후속 작업이 있어야 해결됩니다.

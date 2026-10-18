@@ -39,6 +39,6 @@ delta-rs does not produce Iceberg metadata.
 
 Checklist: `cargo fmt --all`, `cargo clippy -p deltalake-core --features datafusion --tests`,
 `cargo test -p deltalake-core --features datafusion apply_properties`, Python test in
-`python/tests/test_table.py` or `test_create.py`, `git commit -s`.
+`python/tests/test_create.py`, `git commit -s`.
 
 방향(guide 3-3 의 A/B 안)을 이슈에서 메인테이너에게 먼저 확인한 뒤 본문을 맞출 것. 위 본문은 A 안 기준.

@@ -5,16 +5,16 @@
 ## 1. 문제를 한 줄로
 
 compaction 은 결과를 **순서대로** 받는 `buffered` 를 쓰고, 커밋 여부는 결과가 하나 나올 때만 검사합니다.
-그래서 맨 앞 bin 이 느리면 뒤에서 끝난 bin 들이 커밋되지 못한 채 메모리에만 쌓입니다.
+맨 앞 bin 이 느리면 뒤에서 먼저 끝난 bin 들은 커밋되지 못하고 메모리에만 쌓입니다.
 
 ## 2. 코드 읽기
 
 `crates/core/src/operations/optimize.rs`
 
 ```text
- 845-866  Compact: bins 를 스트림으로 만들고 .buffered(max_concurrent_tasks)
- 868-908  ZOrder : 같은 구조인데 .buffer_unordered(max_concurrent_tasks)
- 927-975  loop { stream.next().await → actions 에 누적 → mature(간격 경과) || end 면 commit }
+ 824-866  Compact: bins 를 스트림으로 만들고 .buffered(max_concurrent_tasks)
+ 867-908  ZOrder : 같은 구조인데 .buffer_unordered(max_concurrent_tasks)
+ 927-981  loop { stream.next().await → actions 에 누적 → mature(간격 경과) || end 면 commit }
 ```
 
 Rust/async 개념 메모:
@@ -24,8 +24,8 @@ Rust/async 개념 메모:
 
 ## 3. 먼저 이슈에 질문 댓글
 
-이 `buffered` 는 `86d97cca fix: preserve compact locality by default` 에서 의도적으로 바뀐 것입니다.
-이슈 작성자도 "ordering 이 의도된 것이냐" 고 묻고 답이 없습니다. PR 전에 이슈에 아래처럼 짧게 남기세요.
+`buffered` 는 `86d97cca fix: preserve compact locality by default` 커밋에서 `buffer_unordered` 를 대신해 들어왔습니다.
+이슈 작성자도 "ordering 이 의도된 것이냐" 고 물었지만 아직 답이 없습니다. PR 을 열기 전에 이슈에 아래처럼 짧게 남기세요.
 
 > I traced the ordered `buffered` back to 86d97cca (preserve compact locality). As far as I can see the
 > locality guarantee comes from how bins are planned, not from the order results are yielded, since all
@@ -40,13 +40,14 @@ Rust/async 개념 메모:
 +                    .buffer_unordered(max_concurrent_tasks)
 ```
 
-그리고 `cargo test -p deltalake-core --features datafusion --test it_datafusion optimize` 를 돌려서
-locality 관련 테스트(`test_ordered_compact_bins_*`, `command_optimize.rs` 의 locality 테스트)가 통과하는지 확인합니다.
-통과하면 "커밋 순서는 locality 와 무관하다" 는 근거가 됩니다.
+바꾼 뒤 locality 관련 테스트가 통과하는지 봅니다. `optimize.rs` 의 단위 테스트 `test_ordered_compact_bins_*` 는
+`cargo test -p deltalake-core --features datafusion --lib test_ordered_compact_bins` 로,
+`command_optimize.rs` 의 locality 테스트는 `cargo test -p deltalake-core --features datafusion --test it_datafusion optimize` 로 돌립니다.
+모두 통과하면 "커밋 순서는 locality 와 무관하다" 는 근거가 됩니다.
 
 ## 5. Option B: 타이머로도 커밋
 
-순서를 유지해야 한다는 답이 오면, 커밋 루프에서 "스트림이 멈춰 있어도 간격이 지나면 flush" 하도록 합니다.
+순서를 유지해야 한다는 답이 오면 커밋 루프에서 "스트림이 멈춰 있어도 간격이 지나면 flush" 하도록 합니다.
 
 ```rust
 let mut tick = min_commit_interval.map(|i| tokio::time::interval(i));
@@ -62,13 +63,13 @@ loop {
 }
 ```
 
-이 방식은 `select!` 로 `stream.next()` 가 취소될 때 안전한지(StreamExt::next 는 cancel-safe 합니다) 를 PR 에 적어야 합니다.
-처음이라면 Option A 로 시작하는 것을 권합니다.
+이 방식을 쓰면 `select!` 가 `stream.next()` 를 취소해도 안전하다는 점(StreamExt::next 는 cancel-safe 합니다)을 PR 에 적어 두세요.
+처음이라면 Option A 부터 시작하길 권합니다.
 
 ## 6. 테스트 작성 팁 (Option A 검증)
 
 `command_optimize.rs` 의 `OperationTrackingLogStore` 는 로그스토어 호출을 기록하는 래퍼입니다.
-같은 방식으로 **object store** 의 `put` 을 가로채 특정 파일 이름(첫 bin 의 출력)만 `tokio::time::sleep` 시키면
+같은 식으로 **object store** 의 `put` 을 가로채 특정 파일 이름(첫 bin 의 출력)만 `tokio::time::sleep` 시키면
 "첫 bin 이 느린" 상황을 만들 수 있습니다. 그 상태에서
 
 ```rust
@@ -77,7 +78,7 @@ loop {
 ```
 
 로 compaction 을 돌리고, 느린 bin 이 끝나기 **전에** 커밋이 1개 이상 있는지(`table.version()` 증가) 확인합니다.
-복잡하면 테스트 없이 올리고 PR 본문에 재현 조건을 서술해도 됩니다.
+테스트 작성이 까다로우면 테스트 없이 올리고 PR 본문에 재현 조건을 적어도 됩니다.
 
 ## 7. 체크리스트
 

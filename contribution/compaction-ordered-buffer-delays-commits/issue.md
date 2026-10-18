@@ -11,7 +11,7 @@
 
 - Compaction arm: `.buffered(max_concurrent_tasks)` at line 864 (ordered).
 - Z-order arm: `.buffer_unordered(max_concurrent_tasks)` at line 906.
-- Commit loop (lines 927-975): `min_commit_interval` is only evaluated after `stream.next().await`
+- Commit loop (lines 927-981): `min_commit_interval` is only evaluated after `stream.next().await`
   returns, so finished bins behind a slow head bin cannot be committed until the head finishes.
 
 With a 1 GiB bin taking ~36 min, the reporter saw no commit for ~37 min while five finished outputs

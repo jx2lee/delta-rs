@@ -12,8 +12,8 @@ Body:
 # Description
 
 Z-order split column paths on `.` to support nested struct fields (#2007). That left no way to
-z-order on a column whose name itself contains a dot: both `a.b` and `` `a.b` `` fail with
-`field "a" not found in schema`.
+z-order on a column whose name itself contains a dot: both `a.b` and `` `a.b` `` fail with a
+`field ... not found in schema` error.
 
 Parse each z-order input with `delta_kernel::expressions::ColumnName` so backtick escaping works the
 same way as everywhere else in Delta (`` `a.b` `` is one field, `n.a` is a nested path), and carry

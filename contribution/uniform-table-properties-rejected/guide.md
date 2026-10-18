@@ -11,17 +11,16 @@ UniForm 용 키(`delta.enableIcebergCompatV1/V2/V3`, `delta.universalFormat.enab
 
 | 파일 | 줄 | 무엇 |
 |---|---|---|
-| `crates/core/src/table/config.rs` | 18-100 | `pub enum TableProperty { AppendOnly, ... }` |
+| `crates/core/src/table/config.rs` | 18-121 | `pub enum TableProperty { AppendOnly, ... }` |
 | 같은 파일 | 124-153 | `impl AsRef<str>` : enum → 문자열 |
 | 같은 파일 | 155-190 | `impl FromStr` : 문자열 → enum (`_ => Err("unknown config key")`) |
-| `crates/core/src/kernel/models/actions.rs` | 466-481 | `apply_properties_to_protocol` 에서 `key.parse::<TableProperty>()` 실패 시 에러 |
-| 같은 파일 | 581-612 | `delta.enableDeletionVectors` 를 보고 writer/reader feature 를 켜는 코드. **이번에는 따라 하지 않음**(3-2) |
-| 같은 파일 | 363-420 | `move_table_properties_into_features` 의 문자열 match (A 안이면 수정 안 함) |
+| `crates/core/src/kernel/models/actions.rs` | 467-481 | `apply_properties_to_protocol` 에서 `key.parse::<TableProperty>()` 실패 시 에러 |
+| 같은 파일 | 581-612 | `delta.enableDeletionVectors` 를 보고 writer/reader feature 를 켜는 코드. 참고만 하고 **따라 하지 않음**(3-2) |
+| 같은 파일 | 363-427 | `move_table_properties_into_features` 의 문자열 match (A 안이면 수정 안 함) |
 | `crates/core/src/kernel/transaction/protocol.rs` | 231, 322-345 | `can_write_to` 와 delta-rs 가 지원하는 writer feature 목록 |
 
 Rust 개념 메모:
 - `enum` 에 variant 를 추가하면, 그 enum 을 `match` 하는 모든 곳이 **컴파일 에러**로 빠진 분기를 알려줍니다. 컴파일러를 체크리스트로 쓰면 됩니다.
-- `HashSet<TableFeature>` 에 `.insert(..)` 하면 중복 없이 추가됩니다. `TableFeature::IcebergCompatV2` 는 kernel 에 이미 있습니다(`actions.rs:826` 에서 사용 중).
 
 ## 3. 수정
 
@@ -67,11 +66,9 @@ delta-rs 쪽 사실:
 
 - `crates/core/src/kernel/transaction/protocol.rs` 322-345 의 writer 지원 목록에 `IcebergCompatV1`/`IcebergCompatV2` 가 **없습니다**.
 - 같은 파일 `can_write_to` (231 근처)는 writer version 7 테이블의 `writerFeatures` 중 지원 목록에 없는 것이 있으면 `UnsupportedTableFeatures` 를 냅니다.
-- kernel(`buoyant_kernel-0.28.1/src/table_features/mod.rs` 421-470)도 V1/V2 를 `KernelSupport::NotSupported` 로 표시합니다.
+- kernel(`buoyant_kernel-0.28.1/src/table_features/mod.rs` 421-457)도 V1/V2 를 `KernelSupport::NotSupported` 로 표시합니다.
 
-결국 `apply_properties_to_protocol` 에서 feature 를 켜면 delta-rs 는 **자기가 만든 테이블에 다음 write 부터 쓰지 못합니다**. 지원 목록에 억지로 넣으면 위 요구사항(중첩 field id, 파티션 materialize 등)을 지키지 않은 채 쓰게 되어 스펙 위반 테이블이 생깁니다.
-
-> 이전 버전 guide 는 DV 블록을 따라 feature 를 켜는 코드를 제안했습니다. 위 이유로 철회합니다.
+`apply_properties_to_protocol` 에서 feature 를 켜면 delta-rs 는 **자기가 만든 테이블에 다음 write 부터 쓰지 못합니다**. 그렇다고 지원 목록에 억지로 넣으면 위 요구사항(중첩 field id, 파티션 materialize 등)을 지키지 않고 쓰게 되니 스펙을 어긴 테이블이 생깁니다.
 
 ### 3-3. PR 범위 정하기 (먼저 이슈에 질문)
 
@@ -81,17 +78,17 @@ delta-rs 쪽 사실:
 | B | 3-1 + 키가 `true` 면 "delta-rs writer 는 아직 icebergCompatVn 을 지원하지 않음" 명확한 에러 | 지금의 애매한 파싱 에러가 이유 있는 에러로 바뀜 | 이슈 작성자가 원한 "생성 성공" 은 아님 |
 | C | writer 요구사항 구현 후 지원 목록에 추가 | 실제로 지원 | ★★★★★. 이 이슈 범위를 크게 넘음 |
 
-이슈에 남길 질문 예시(영어로 다듬어서):
+이슈에 남길 질문 예시(영어는 다듬어서 쓰세요):
 
 > `icebergCompatV2` is not in delta-rs' supported writer features, so enabling the feature in the protocol would make the table unwritable by delta-rs itself. Would you accept a PR that only lets these keys parse (A), or prefer an explicit "not supported" error (B)?
 
-A 로 가면 3-1 뒤에 `move_table_properties_into_features`(363 근처) 는 **수정하지 않습니다**. 여기에 분기를 넣으면 같은 문제가 생깁니다.
+A 안에서는 `move_table_properties_into_features`(363 근처)를 **고치지 않습니다**. 여기에 분기를 넣어도 같은 문제가 생깁니다.
 
 ### 3-4. V3 는 넣지 않기
 
 - `icebergCompatV3` 는 PROTOCOL.md 본문에 **없습니다**. `protocol_rfcs/iceberg-compat-v3.md` 에 Proposed RFC(2025-05-19, delta-io/delta 이슈 4574)로만 있고, `protocol_rfcs/README.md` 의 Accepted 목록에 없습니다.
 - kernel 에는 `TableFeature::IcebergCompatV3` 가 있지만(row tracking 필수, V1/V2 와 달리 DV 허용) 스펙이 확정되지 않았습니다.
-- 그래서 3-1 의 `EnableIcebergCompatV3` variant 와 문자열 매핑은 빼고 V1/V2 + `universalFormat.enabledFormats` 세 키만 다룹니다. 리뷰어가 요청하면 그때 추가하세요.
+- 그래서 `EnableIcebergCompatV3` variant 와 문자열 매핑은 만들지 않고, V1/V2 와 `universalFormat.enabledFormats` 세 키만 다룹니다. 리뷰어가 요청하면 그때 추가하세요.
 
 ### 3-5. 범위 밖 (PR 에 "하지 않은 것" 으로 적기)
 
@@ -100,7 +97,7 @@ A 로 가면 3-1 뒤에 `move_table_properties_into_features`(363 근처) 는 **
 
 ## 4. 테스트
 
-Rust (`crates/core/src/kernel/models/actions.rs` 의 기존 `apply_properties_to_protocol` 테스트 1489-1546 옆에):
+Rust (`crates/core/src/kernel/models/actions.rs` 의 기존 `apply_properties_to_protocol` 테스트 1480-1621 옆에):
 
 ```rust
 #[test]
@@ -116,7 +113,7 @@ fn test_iceberg_compat_property_is_accepted_without_feature() {
 ```
 
 Python (`python/tests/test_create.py` 근처): 이슈의 코드 그대로 `DeltaTable.create(..., configuration=...)` 가 성공하고
-`dt.metadata().configuration` 에 두 키가 있는지 확인. 이어서 `write_deltalake(dt, data, mode="append")` 가 성공하는지도 확인합니다. feature 를 켜는 구현이면 여기서 실패합니다.
+`dt.metadata().configuration` 에 두 키가 있는지 확인합니다. 그다음 `write_deltalake(dt, data, mode="append")` 가 성공하는지도 확인합니다. feature 를 켜는 구현이면 여기서 실패합니다.
 
 ## 5. 실행
 

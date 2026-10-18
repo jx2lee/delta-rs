@@ -10,8 +10,8 @@
 `DeltaScanConfig::schema` lets a caller narrow the schema, including nested struct children.
 `ProjectedScanContract::scan_schema` honours that (only `s.l`), but `KernelScanPlan::try_new_with_contract`
 builds the kernel scan from a **root-level** projection (`kernel_logical_schema.project(&names)`,
-`plan.rs:306-314`) and then derives `parquet_read_schema` from `scan.physical_schema()`
-(`plan.rs:318-321`). The kernel physical schema still has the full struct, so the Parquet reader
+`plan.rs:301-314`) and then derives `parquet_read_schema` from `scan.physical_schema()`
+(`plan.rs:315-318`). The kernel physical schema still has the full struct, so the Parquet reader
 reads every sibling leaf (`s.b` as well as `s.l`).
 
 ## Repro (run 2026-10-13, test added to `plan.rs` tests module)
