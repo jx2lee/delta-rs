@@ -6,7 +6,7 @@
 
 | # | 폴더 | 이슈 | 난이도 | 재현 방식 | 비고 |
 |---|---|---|---|---|---|
-| 2 | `uniform-table-properties-rejected` | #3299 | ★★ | in-memory create 로 에러 재현 | enum variant + writer feature |
+| 2 | `uniform-table-properties-rejected` | #3299 | ★★ | in-memory create 로 에러 재현 | enum variant 만. writer feature 는 delta-rs 미지원이라 켜면 안 됨, 이슈에 방향 질문 먼저 |
 | 3 | `zorder-dotted-column-names` | #4363 | ★★ | in-memory z-order 로 에러 재현 | kernel `ColumnName` 파서 사용. 이전 `take` 있음 |
 | 4 | `compaction-ordered-buffer-delays-commits` | #4749 | ★★ | 코드·git 이력 대조 | 1줄 fix 가능하나 먼저 이슈에 방향 질문 |
 | 5 | `nested-schema-override-widened-in-parquet-read` | #4678 | ★★★★ | `plan.rs` 단위 테스트 실패 확인 | 닫힌 PR 2개의 리뷰 코멘트 반영 필요 |
@@ -34,6 +34,7 @@
 
 ## 공통 주의
 
+- **upstream 에 링크 걸지 않기.** 이 브랜치는 `origin`(jx2lee/delta-rs) 에만 push 하고 `upstream` 에는 push 하지 않는다. 커밋 메시지에 `delta-io/delta-rs#123` 이나 upstream 이슈·PR URL 을 쓰면 upstream 이슈 타임라인에 "referenced this issue" 가 생기므로 쓰지 않는다. 커밋 메시지에서는 번호 없이 폴더 이름으로 가리킨다. 문서(.md) 본문 안의 링크는 타임라인에 남지 않으니 괜찮다.
 - CONTRIBUTING.md: **AI 로만 만든 PR 은 닫힐 수 있음**(#4437 가 그 이유로 닫힘). 무엇을 직접 검증했는지 PR 본문에 적을 것.
 - 이슈에 `take` 댓글 → 자동 할당. 커밋은 `git commit -s`(DCO). 제목은 소문자 conventional commits.
 - 체크: `cargo fmt --all`, `cargo clippy -p <crate> --tests`, 해당 crate 테스트.
