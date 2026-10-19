@@ -830,7 +830,7 @@ index 3854d869..df880693 100644
      // Keep the previous single-writer fan-in path for unpartitioned tables.
      if partition_columns.is_empty() {
 diff --git a/crates/core/src/operations/write/mod.rs b/crates/core/src/operations/write/mod.rs
-index 070b105c..cc473351 100644
+index 070b105c..d1ef9855 100644
 --- a/crates/core/src/operations/write/mod.rs
 +++ b/crates/core/src/operations/write/mod.rs
 @@ -670,6 +670,7 @@ mod tests {
@@ -1107,7 +1107,7 @@ index 070b105c..cc473351 100644
 +        assert!(stats["nullCount"].get(&p_phys).is_none(), "{stats}");
 +        // tagged like Delta Spark tags its files, so its UniForm upgrade keeps them
 +        assert_eq!(
-+            file.add_action().tags.unwrap()["ICEBERG_COMPAT_VERSION"].as_deref(),
++            file.to_add().tags.unwrap()["ICEBERG_COMPAT_VERSION"].as_deref(),
 +            Some("2")
 +        );
 +        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(

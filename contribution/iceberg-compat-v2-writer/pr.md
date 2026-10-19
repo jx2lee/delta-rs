@@ -2,6 +2,17 @@ Four PRs, in order. PR 0 is independent of Iceberg (file an issue first); ask on
 
 Verified locally on upstream main `f67f1210` (2026-10-19) with all four applied: 6 new tests, `deltalake-core` lib (1360) / `it_datafusion` (167) / `it` (49) suites, fmt, clippy. Iceberg reader: Delta Spark 4.4.1 UniForm converted the table and pyiceberg 0.12 read it back, both directions (`plan-integration.md`).
 
+Branches on `origin` (jx2lee/delta-rs), split from `prototype.diff` on 2026-10-20, each tested on its own (fmt, clippy on touched files, the tests it adds; PR 3 also the full lib and `it_datafusion` suites):
+
+| PR | branch | base | commit | per-branch diff |
+|---|---|---|---|---|
+| 0 | `jx2lee/fix/arrow-schema-view-types` | upstream main `f67f1210` | `c5db2e93` | 4 files, +128/−19 |
+| 1 | `jx2lee/feat/materialize-partition-columns` | upstream main `f67f1210` | `f7814766` | 8 files, +159/−11 |
+| 2 | `jx2lee/feat/column-mapping-nested-ids` | PR 1 | `337f98a1` | 4 files, +319/−22 |
+| 3 | `jx2lee/feat/iceberg-compat-v2` | PR 2 | `3e948a19` | 7 files, +204/−2 |
+
+PR 2's `test_iceberg_compat_v2_writes_nested_field_ids` checks the nested ids and the parquet `field_id`s only (the partition column is still stripped there); PR 3 extends the same test with the protocol, materialization and tag assertions and adds the rejection test. Open PR 2 and PR 3 against upstream `main` with "stacked on PR n" in the body, or rebase them once the one below is merged. Upstream main had not moved past `f67f1210` when the branches were pushed.
+
 ---
 
 ## PR 0
