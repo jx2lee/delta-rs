@@ -4,12 +4,13 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Fields, Schema};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::AsyncFileWriter;
+use parquet::arrow::{AsyncArrowWriter, add_encoded_arrow_schema_to_metadata};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use tokio::io::AsyncWriteExt as _;
@@ -136,6 +137,34 @@ impl AsyncFileWriter for ParquetObjectWriter {
     }
 }
 
+/// `schema` with the in-memory-only types replaced by the types the Delta schema maps to:
+/// `Utf8View`/`BinaryView` by `Utf8`/`Binary`, a dictionary by its value type. The parquet
+/// encoding is the same either way; only the `ARROW:schema` footer differs.
+fn without_view_types(schema: &Schema) -> Schema {
+    fn field(field: &Field) -> Field {
+        Field::new(
+            field.name(),
+            data_type(field.data_type()),
+            field.is_nullable(),
+        )
+        .with_metadata(field.metadata().clone())
+    }
+    fn data_type(dt: &DataType) -> DataType {
+        match dt {
+            DataType::Utf8View => DataType::Utf8,
+            DataType::BinaryView => DataType::Binary,
+            DataType::Dictionary(_, value) => data_type(value),
+            DataType::List(inner) => DataType::List(Arc::new(field(inner))),
+            DataType::LargeList(inner) => DataType::LargeList(Arc::new(field(inner))),
+            DataType::Map(inner, sorted) => DataType::Map(Arc::new(field(inner)), *sorted),
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(|f| field(f)).collect()),
+            other => other.clone(),
+        }
+    }
+    let fields: Fields = schema.fields().iter().map(|f| field(f)).collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
 /// The parquet writer of one file: its columns encoded in parallel, or one after another
 /// by arrow-rs. Chosen by [`ArrowWriterOptions::with_enable_parallel_encoding`].
 pub(super) enum FileArrowWriter {
@@ -146,27 +175,29 @@ pub(super) enum FileArrowWriter {
 impl FileArrowWriter {
     fn try_new(writer: ParquetObjectWriter, config: &PartitionWriterConfig) -> ParquetResult<Self> {
         let options = config.writer_properties.arrow_options();
+        let mut props = config
+            .writer_properties
+            .parquet_properties_or_default()
+            .clone();
+        // The `ARROW:schema` footer is written here, from the schema a scan-free reader
+        // expects, instead of by the arrow writer: batches that come from a DataFusion scan
+        // carry view and dictionary types, and a reader restoring those from the footer
+        // (pyarrow, pyiceberg) cannot combine such files with files written from plain types.
+        if !options.skip_arrow_metadata() {
+            add_encoded_arrow_schema_to_metadata(
+                &without_view_types(&config.file_schema),
+                &mut props,
+            );
+        }
+        let options = options.clone().with_skip_arrow_metadata(true);
         if options.enable_parallel_encoding() {
-            ParallelArrowWriter::try_new(
-                writer,
-                config.file_schema.clone(),
-                config
-                    .writer_properties
-                    .parquet_properties_or_default()
-                    .clone(),
-                Some(options.clone()),
-            )
-            .map(Self::Parallel)
+            ParallelArrowWriter::try_new(writer, config.file_schema.clone(), props, Some(options))
+                .map(Self::Parallel)
         } else {
             AsyncArrowWriter::try_new_with_options(
                 writer,
                 config.file_schema.clone(),
-                options.to_parquet_options(
-                    config
-                        .writer_properties
-                        .parquet_properties_or_default()
-                        .clone(),
-                ),
+                options.to_parquet_options(props),
             )
             .map(Self::Serial)
         }
@@ -350,5 +381,48 @@ impl LazyArrowWriter {
             LazyArrowWriter::Initialized(_, _, _) => 0,
             LazyArrowWriter::Writing(_, arrow_writer) => arrow_writer.in_progress_rows(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_view_types_replaces_in_memory_types_everywhere() {
+        let dict = DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
+            Field::new("p", dict.clone(), true),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "st",
+                DataType::Struct(vec![Field::new("inner", dict, true)].into()),
+                true,
+            ),
+            Field::new("i", DataType::Int32, false),
+        ]);
+        let expected = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("p", DataType::Utf8, true),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "st",
+                DataType::Struct(vec![Field::new("inner", DataType::Utf8, true)].into()),
+                true,
+            ),
+            Field::new("i", DataType::Int32, false),
+        ]);
+        assert_eq!(without_view_types(&schema), expected);
     }
 }

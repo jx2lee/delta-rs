@@ -2275,6 +2275,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_rewrites_file_with_plain_types_in_arrow_schema() -> DeltaResult<()> {
+        // The rewrite scan yields Utf8View (and dictionaries for partition columns); the
+        // file's ARROW:schema must still say Utf8, like a file written from plain batches,
+        // or pyarrow-based readers cannot combine the two kinds of file.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )?;
+        let table = DeltaTable::new_in_memory().write(vec![batch]).await?;
+        let (table, _) = table.delete().with_predicate("name = 'bob'").await?;
+
+        let files = table.get_files_by_partitions(&[]).await?;
+        assert_eq!(files.len(), 1);
+        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
+            table.log_store().object_store(),
+            files[0].clone(),
+        );
+        let builder =
+            parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await?;
+        assert_eq!(builder.schema().as_ref(), schema.as_ref());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delete_custom_session_schema_force_view_types_disabled() -> DeltaResult<()> {
         // Integration guardrail: user-supplied DataFusion sessions may disable view types.
         // Predicate resolution must respect the provided session's config.

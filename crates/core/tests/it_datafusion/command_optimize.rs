@@ -1929,7 +1929,7 @@ async fn test_zorder_unpartitioned() -> Result<(), Box<dyn Error>> {
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 1, 1, 1, 2])),
             Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 2])),
-            Arc::new(StringViewArray::from(vec![
+            Arc::new(StringArray::from(vec![
                 "1970-01-01",
                 "1970-01-04",
                 "1970-01-01",
@@ -2285,7 +2285,7 @@ async fn test_optimize_spark_written_nullable_nested_field() -> Result<(), Box<d
         .column_by_name("int_id")
         .unwrap()
         .as_any()
-        .downcast_ref::<arrow_array::StringViewArray>()
+        .downcast_ref::<arrow_array::StringArray>()
         .unwrap();
     let mut actual: Vec<&str> = int_id_col.iter().map(|v| v.expect("non-null")).collect();
     actual.sort_unstable();

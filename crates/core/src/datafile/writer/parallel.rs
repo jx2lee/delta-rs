@@ -88,6 +88,10 @@ impl ArrowWriterOptions {
         self.enable_parallel_encoding
     }
 
+    pub(crate) fn skip_arrow_metadata(&self) -> bool {
+        self.skip_arrow_metadata_hint
+    }
+
     /// The same settings as parquet's own options, for `AsyncArrowWriter`.
     pub(crate) fn to_parquet_options(
         &self,
