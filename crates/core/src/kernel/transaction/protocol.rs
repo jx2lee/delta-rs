@@ -339,6 +339,10 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
         // The DataFusion write paths (write, merge, update, delete, optimize) keep the
         // partition columns in the data files when the table requires it.
         writer_features.insert(TableFeature::MaterializePartitionColumns);
+        // IcebergCompatV2: column mapping + nested field ids + materialized partition
+        // columns + numRecords stats, all produced by the DataFusion write paths; the
+        // schema restrictions are checked when the table is created.
+        writer_features.insert(TableFeature::IcebergCompatV2);
     }
     writer_features.insert(TableFeature::DeletionVectors);
     // writer_features.insert(TableFeature::IdentityColumns);

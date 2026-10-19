@@ -7,6 +7,7 @@
 //! [`ReaderProperties`] is the read-side counterpart: it builds DataFusion's
 //! [`TableParquetOptions`](datafusion::config::TableParquetOptions) for Delta scans.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::sync::LazyLock;
@@ -177,6 +178,8 @@ pub struct DeltaWriterProperties {
     pub(crate) write_batch_size: Option<usize>,
     /// Which columns get data-skipping stats. Unset, operations use the table's.
     pub(crate) stats: Option<WriterStatsConfig>,
+    /// `tags` every `add` action gets ([`Self::apply_table_file_tags`]).
+    pub(crate) file_tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl DeltaWriterProperties {
@@ -202,6 +205,7 @@ impl DeltaWriterProperties {
             target_file_size: overrides.target_file_size.or(self.target_file_size),
             write_batch_size: overrides.write_batch_size.or(self.write_batch_size),
             stats: overrides.stats.or(self.stats),
+            file_tags: overrides.file_tags.or(self.file_tags),
         }
     }
 
@@ -249,6 +253,21 @@ impl DeltaWriterProperties {
     pub(crate) fn apply_table_stats(mut self, table_config: &TableConfiguration) -> Self {
         if self.stats.is_none() {
             self.stats = Some(WriterStatsConfig::from_config(table_config));
+        }
+        self.apply_table_file_tags(table_config)
+    }
+
+    /// Tag the data files the way Delta Spark does on an `icebergCompatV2` table
+    /// (`ICEBERG_COMPAT_VERSION`), so its `REORG TABLE ... APPLY (UPGRADE UNIFORM)` leaves
+    /// them alone instead of rewriting every file that lacks the tag. Not in PROTOCOL.md.
+    fn apply_table_file_tags(mut self, table_config: &TableConfiguration) -> Self {
+        if self.file_tags.is_none()
+            && table_config.is_feature_enabled(&TableFeature::IcebergCompatV2)
+        {
+            self.file_tags = Some(HashMap::from([(
+                "ICEBERG_COMPAT_VERSION".to_string(),
+                Some("2".to_string()),
+            )]));
         }
         self
     }

@@ -670,6 +670,7 @@ mod tests {
     use crate::TableProperty;
     use crate::ensure_table_uri;
     use crate::kernel::CommitInfo;
+    use crate::kernel::ProtocolExt as _;
     use crate::logstore::get_actions;
     use crate::operations::collect_sendable_stream;
     use crate::protocol::SaveMode;
@@ -688,6 +689,7 @@ mod tests {
     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::schema::MetadataValue;
+    use delta_kernel::table_features::TableFeature;
     use futures::TryStreamExt;
     use itertools::Itertools;
     use serde_json::{Value, json};
@@ -992,6 +994,20 @@ mod tests {
             .unwrap();
 
         let snapshot = table.snapshot().unwrap().snapshot();
+        // the property turned on the writer feature, which delta-rs supports
+        let protocol = snapshot.protocol();
+        assert_eq!(protocol.min_writer_version(), 7);
+        let writer_features = protocol.writer_features_set().unwrap();
+        assert!(writer_features.contains(&TableFeature::IcebergCompatV2));
+        assert!(writer_features.contains(&TableFeature::ColumnMapping));
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::IcebergCompatV2)
+        );
+        crate::kernel::transaction::PROTOCOL
+            .can_write_to(snapshot)
+            .unwrap();
         let schema = snapshot.schema();
         let nested_ids = |field: &StructField| -> HashMap<String, i64> {
             match field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds) {
@@ -1036,6 +1052,7 @@ mod tests {
         );
 
         let p = schema.field("p").unwrap();
+        let p_phys = physical(p);
 
         // 5 column-mapping ids (arr, m, s, inner, p) + 5 nested ids, all distinct
         let all_ids: Vec<i64> = [arr, m, s, inner, p]
@@ -1090,9 +1107,21 @@ mod tests {
 
         let files = table.get_files_by_partitions(&[]).await.unwrap();
         assert_eq!(files.len(), 1);
-        // the feature is not enabled yet, so the partition column is still stripped
+        // the partition column is materialized under its physical name, without stats
         let columns = data_file_columns(&table, &files[0]).await;
-        assert_eq!(columns, [&arr_phys, &m_phys, &s_phys].map(String::as_str));
+        assert_eq!(
+            columns,
+            [&arr_phys, &m_phys, &s_phys, &p_phys].map(String::as_str)
+        );
+        let file = table.snapshot().unwrap().log_data().iter().next().unwrap();
+        let stats: Value = serde_json::from_str(&file.stats().unwrap()).unwrap();
+        assert_eq!(stats["numRecords"], 2);
+        assert!(stats["nullCount"].get(&p_phys).is_none(), "{stats}");
+        // tagged like Delta Spark tags its files, so its UniForm upgrade keeps them
+        assert_eq!(
+            file.to_add().tags.unwrap()["ICEBERG_COMPAT_VERSION"].as_deref(),
+            Some("2")
+        );
         let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
             table.log_store().object_store(),
             files[0].clone(),
@@ -1138,6 +1167,47 @@ mod tests {
 
         let data = get_data(&table).await;
         assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// The property is refused without column mapping, together with deletion vectors or
+    /// IcebergCompatV1, and for types outside the IcebergCompatV2 allow-list.
+    #[tokio::test]
+    async fn test_iceberg_compat_v2_rejects_unsupported_configuration() {
+        use delta_kernel::schema::{DataType as KernelDataType, StructField};
+
+        let v2 = ("delta.enableIcebergCompatV2", "true");
+        let name = ("delta.columnMapping.mode", "name");
+        for (properties, message) in [
+            (vec![v2], "requires delta.columnMapping.mode"),
+            (
+                vec![name, v2, ("delta.enableDeletionVectors", "true")],
+                "delta.enableDeletionVectors",
+            ),
+            (
+                vec![name, v2, ("delta.enableIcebergCompatV1", "true")],
+                "delta.enableIcebergCompatV1",
+            ),
+        ] {
+            let err = DeltaTable::new_in_memory()
+                .create()
+                .with_columns(get_delta_schema().fields().cloned())
+                .with_configuration(properties.into_iter().map(|(k, v)| (k, Some(v))))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(message), "{err}");
+        }
+
+        let err = DeltaTable::new_in_memory()
+            .create()
+            .with_columns([StructField::new(
+                "v",
+                KernelDataType::unshredded_variant(),
+                true,
+            )])
+            .with_configuration([name, v2].into_iter().map(|(k, v)| (k, Some(v))))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not allow the type"), "{err}");
     }
 
     /// `delta.writePartitionColumnsToParquet` materializes without a writer feature.

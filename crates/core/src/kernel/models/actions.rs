@@ -384,6 +384,9 @@ impl ProtocolInner {
                     "delta.enableRowTracking" if parse_bool(value) => {
                         Some(TableFeature::RowTracking)
                     }
+                    "delta.enableIcebergCompatV2" if parse_bool(value) => {
+                        Some(TableFeature::IcebergCompatV2)
+                    }
                     "delta.checkpointPolicy" if value == "v2" => Some(TableFeature::V2Checkpoint),
                     _ => None,
                 })
@@ -527,6 +530,54 @@ impl ProtocolInner {
                     )));
                 }
             }
+        }
+
+        // IcebergCompatV2 (PROTOCOL.md "Iceberg Compatibility V2"): a writer-only feature that
+        // requires column mapping and excludes IcebergCompatV1 and active deletion vectors.
+        // The writer requirements themselves (partition columns in the data files, nested
+        // field ids, numRecords stats) are met by the DataFusion write paths.
+        let property_is_true = |property: &TableProperty| -> DeltaResult<bool> {
+            match parsed_properties.get(property) {
+                None => Ok(false),
+                Some(value) => value.to_ascii_lowercase().parse::<bool>().map_err(|_| {
+                    Error::Generic(format!(
+                        "{} = '{value}' is invalid, valid values are ['true', 'false']",
+                        property.as_ref()
+                    ))
+                }),
+            }
+        };
+        if property_is_true(&TableProperty::EnableIcebergCompatV2)? {
+            let column_mapping_in_properties = parsed_properties
+                .get(&TableProperty::ColumnMappingMode)
+                .is_some_and(|mode| mode != "none");
+            let column_mapping_in_protocol = self.min_reader_version == 2
+                || self
+                    .reader_features
+                    .as_ref()
+                    .is_some_and(|features| features.contains(&TableFeature::ColumnMapping));
+            if !column_mapping_in_properties && !column_mapping_in_protocol {
+                return Err(Error::Generic(
+                    "delta.enableIcebergCompatV2 requires delta.columnMapping.mode = 'name' or 'id'"
+                        .to_string(),
+                ));
+            }
+            if property_is_true(&TableProperty::EnableIcebergCompatV1)? {
+                return Err(Error::Generic(
+                    "delta.enableIcebergCompatV2 cannot be combined with delta.enableIcebergCompatV1"
+                        .to_string(),
+                ));
+            }
+            if property_is_true(&TableProperty::EnableDeletionVectors)? {
+                return Err(Error::Generic(
+                    "delta.enableIcebergCompatV2 cannot be combined with delta.enableDeletionVectors"
+                        .to_string(),
+                ));
+            }
+            self.min_writer_version = 7;
+            self.writer_features
+                .get_or_insert_with(HashSet::new)
+                .insert(TableFeature::IcebergCompatV2);
         }
 
         // Check columnMappingMode and bump protocol or add reader/writerFeatures
@@ -723,6 +774,8 @@ pub enum TableFeatures {
     DomainMetadata,
     /// Iceberg compatibility support
     IcebergCompatV1,
+    /// Iceberg compatibility V2 support (UniForm)
+    IcebergCompatV2,
     /// Variant type support
     VariantType,
     /// Preview variant type support
@@ -753,6 +806,7 @@ impl FromStr for TableFeatures {
             "rowTracking" => Ok(TableFeatures::RowTracking),
             "domainMetadata" => Ok(TableFeatures::DomainMetadata),
             "icebergCompatV1" => Ok(TableFeatures::IcebergCompatV1),
+            "icebergCompatV2" => Ok(TableFeatures::IcebergCompatV2),
             "variantType" => Ok(TableFeatures::VariantType),
             "variantType-preview" => Ok(TableFeatures::VariantTypePreview),
             "variantShredding-preview" => Ok(TableFeatures::VariantShreddingPreview),
@@ -780,6 +834,7 @@ impl AsRef<str> for TableFeatures {
             TableFeatures::RowTracking => "rowTracking",
             TableFeatures::DomainMetadata => "domainMetadata",
             TableFeatures::IcebergCompatV1 => "icebergCompatV1",
+            TableFeatures::IcebergCompatV2 => "icebergCompatV2",
             TableFeatures::VariantType => "variantType",
             TableFeatures::VariantTypePreview => "variantType-preview",
             TableFeatures::VariantShreddingPreview => "variantShredding-preview",

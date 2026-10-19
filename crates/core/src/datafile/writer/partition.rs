@@ -385,6 +385,10 @@ impl PartitionWriter {
                 .map_err(|err| WriteError::CreateAdd {
                     source: Box::new(err),
                 })
+                .map(|add| Add {
+                    tags: self.config.writer_properties.file_tags.clone(),
+                    ..add
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 

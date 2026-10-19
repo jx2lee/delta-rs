@@ -73,6 +73,15 @@ fn plan_set_table_properties_actions(
             "SET TBLPROPERTIES delta.columnMapping.mode",
         ));
     }
+    // The nested field ids IcebergCompatV2 needs are assigned to the schema at CREATE TABLE.
+    if properties
+        .get(TableProperty::EnableIcebergCompatV2.as_ref())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Err(DeltaTableError::Generic(
+            "delta.enableIcebergCompatV2 can only be set when the table is created".to_string(),
+        ));
+    }
 
     let mut metadata = snapshot.metadata.clone();
     let current_protocol = snapshot.protocol;

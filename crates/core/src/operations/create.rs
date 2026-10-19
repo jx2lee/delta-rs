@@ -61,6 +61,44 @@ fn data_type_has_column_mapping_metadata(data_type: &DataType) -> bool {
     }
 }
 
+/// IcebergCompatV2 allows only `byte`, `short`, `integer`, `long`, `float`, `double`, `decimal`,
+/// `string`, `binary`, `boolean`, `timestamp`, `timestampNTZ`, `date`, `array`, `map` and
+/// `struct` (PROTOCOL.md "Writer Requirements for IcebergCompatV2"). Column mapping already
+/// blocks later schema changes on the table, so the schema is only checked here.
+fn ensure_iceberg_compat_v2_types(schema: &StructType) -> DeltaResult<()> {
+    fn check(data_type: &DataType, path: &str) -> DeltaResult<()> {
+        use delta_kernel::schema::PrimitiveType;
+        match data_type {
+            DataType::Primitive(primitive) => match primitive {
+                PrimitiveType::Void => Err(unsupported(path, data_type)),
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanos | PrimitiveType::TimestampNanosNtz => {
+                    Err(unsupported(path, data_type))
+                }
+                _ => Ok(()),
+            },
+            DataType::Variant(_) => Err(unsupported(path, data_type)),
+            DataType::Array(array) => check(array.element_type(), &format!("{path}.element")),
+            DataType::Map(map) => {
+                check(map.key_type(), &format!("{path}.key"))?;
+                check(map.value_type(), &format!("{path}.value"))
+            }
+            DataType::Struct(fields) => fields.fields().try_for_each(|field| {
+                check(field.data_type(), &format!("{path}.{}", field.name()))
+            }),
+        }
+    }
+    fn unsupported(path: &str, data_type: &DataType) -> DeltaTableError {
+        DeltaTableError::Generic(format!(
+            "delta.enableIcebergCompatV2 does not allow the type {data_type} of column '{}'",
+            path.trim_start_matches('.')
+        ))
+    }
+    schema
+        .fields()
+        .try_for_each(|field| check(field.data_type(), field.name()))
+}
+
 fn field_has_column_mapping_metadata(field: &StructField) -> bool {
     field
         .metadata()
@@ -334,6 +372,9 @@ impl CreateBuilder {
             let nested_ids = configuration
                 .get(TableProperty::EnableIcebergCompatV2.as_ref())
                 .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            if nested_ids {
+                ensure_iceberg_compat_v2_types(&schema)?;
+            }
             let mapped = assign_column_mapping_metadata(&schema, &mut max_id, nested_ids)?;
             configuration.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
