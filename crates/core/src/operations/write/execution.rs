@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 
 use crate::DeltaTableError;
 use crate::datafile::DeltaWriterProperties;
+use crate::datafile::properties::materialize_partition_columns;
 use crate::datafile::writer::{DeltaWriter, UploadBudget, WriterConfig, write_batches_timed};
 use crate::delta_datafusion::{ColumnMappingState, DataValidationExec, validation_predicates};
 use crate::errors::DeltaResult;
@@ -283,6 +284,8 @@ struct WriteSinkConfig {
     column_mapping: Option<ColumnMappingState>,
     /// Directory under the table root the data files go below.
     path_prefix: Option<Path>,
+    /// Keep the partition columns in the data files (see [`materialize_partition_columns`]).
+    materialize_partition_columns: bool,
 }
 
 impl WriteSinkConfig {
@@ -297,6 +300,7 @@ impl WriteSinkConfig {
             props: props.apply_table_stats(table_config),
             column_mapping: ColumnMappingState::from_table_config(table_config),
             path_prefix: None,
+            materialize_partition_columns: materialize_partition_columns(table_config),
         }
     }
 
@@ -754,12 +758,14 @@ async fn write_data_plan(
         props,
         column_mapping,
         path_prefix,
+        materialize_partition_columns,
     } = sink_config;
     let (plan, partition_columns, random_prefix_length) =
         apply_column_mapping_to_plan(plan, partition_columns, &column_mapping)?;
     let config = WriterConfig::new(plan.schema().clone(), partition_columns.clone(), props)
         .with_random_prefix_length(random_prefix_length)
-        .with_path_prefix(path_prefix);
+        .with_path_prefix(path_prefix)
+        .with_materialize_partition_columns(materialize_partition_columns);
 
     // For unpartitioned writes, centralize writer behavior through write_streams.
     if partition_columns.is_empty() {
@@ -909,6 +915,7 @@ async fn write_cdc_plan(
         props,
         column_mapping,
         path_prefix,
+        materialize_partition_columns,
     } = sink_config;
     if path_prefix.is_some() {
         return Err(DeltaTableError::generic(
@@ -944,12 +951,14 @@ async fn write_cdc_plan(
         props.clone(),
     )
     .with_random_prefix_length(random_prefix_length)
-    .with_upload_budget(upload_budget.clone());
+    .with_upload_budget(upload_budget.clone())
+    .with_materialize_partition_columns(materialize_partition_columns);
 
     let cdf_config = WriterConfig::new(cdf_schema.clone(), partition_columns.clone(), props)
         .with_random_prefix_length(random_prefix_length)
         .with_path_prefix(Some(Path::from(CHANGE_DATA_DIR)))
-        .with_upload_budget(upload_budget);
+        .with_upload_budget(upload_budget)
+        .with_materialize_partition_columns(materialize_partition_columns);
 
     // Keep the previous single-writer fan-in path for unpartitioned tables.
     if partition_columns.is_empty() {

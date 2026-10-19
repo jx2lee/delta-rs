@@ -43,6 +43,15 @@ pub(crate) fn ensure_legacy_writer_supports_table(
             operation,
         ));
     }
+    // The legacy writers strip the partition columns from the data files unconditionally.
+    if crate::datafile::properties::materialize_partition_columns(
+        table.snapshot()?.snapshot().table_configuration(),
+    ) {
+        return Err(DeltaTableError::Generic(format!(
+            "{operation} does not support tables that materialize partition columns \
+             (materializePartitionColumns, icebergCompatV1/V2, delta.writePartitionColumnsToParquet)"
+        )));
+    }
 
     Ok(())
 }

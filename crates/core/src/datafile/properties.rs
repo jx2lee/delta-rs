@@ -12,6 +12,7 @@ use std::num::NonZeroU64;
 use std::sync::LazyLock;
 
 use delta_kernel::table_configuration::TableConfiguration;
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -20,7 +21,7 @@ use crate::datafile::writer::ArrowWriterOptions;
 use crate::errors::DeltaResult;
 use crate::kernel::arrow::engine_ext::stats_table_properties;
 use crate::parquet_utils::default_writer_properties;
-use crate::table::config::{DEFAULT_NUM_INDEX_COLS, TablePropertiesExt as _};
+use crate::table::config::{DEFAULT_NUM_INDEX_COLS, TablePropertiesExt as _, TableProperty};
 
 /// Rows per slice handed to the parquet writer when none is set.
 pub(crate) const DEFAULT_WRITE_BATCH_SIZE: usize = 8192;
@@ -141,6 +142,20 @@ impl WriterStatsConfig {
                 .map(|columns| columns.iter().map(|c| c.to_string()).collect()),
         }
     }
+}
+
+/// Whether data files must carry the partition columns (PROTOCOL.md, "Materialize Partition
+/// Columns"): a writer feature that requires it takes priority, otherwise the
+/// `delta.writePartitionColumnsToParquet` table property decides.
+pub(crate) fn materialize_partition_columns(config: &TableConfiguration) -> bool {
+    config.is_feature_supported(&TableFeature::MaterializePartitionColumns)
+        || config.is_feature_enabled(&TableFeature::IcebergCompatV1)
+        || config.is_feature_enabled(&TableFeature::IcebergCompatV2)
+        || config
+            .table_properties()
+            .unknown_properties
+            .get(TableProperty::WritePartitionColumnsToParquet.as_ref())
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// Everything that shapes a Delta data file.

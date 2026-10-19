@@ -119,6 +119,10 @@ pub enum TableProperty {
 
     /// 'classic' for classic Delta Lake checkpoints. 'v2' for v2 checkpoints.
     CheckpointPolicy,
+
+    /// true for writers to also store partition column values in the data files, in the absence
+    /// of a writer feature (`materializePartitionColumns`, `icebergCompatV1/V2`) that requires it.
+    WritePartitionColumnsToParquet,
 }
 
 impl AsRef<str> for TableProperty {
@@ -148,6 +152,7 @@ impl AsRef<str> for TableProperty {
             Self::SetTransactionRetentionDuration => "delta.setTransactionRetentionDuration",
             Self::TargetFileSize => "delta.targetFileSize",
             Self::TuneFileSizesForRewrites => "delta.tuneFileSizesForRewrites",
+            Self::WritePartitionColumnsToParquet => "delta.writePartitionColumnsToParquet",
         }
     }
 }
@@ -185,6 +190,7 @@ impl FromStr for TableProperty {
             "delta.setTransactionRetentionDuration" => Ok(Self::SetTransactionRetentionDuration),
             "delta.targetFileSize" => Ok(Self::TargetFileSize),
             "delta.tuneFileSizesForRewrites" => Ok(Self::TuneFileSizesForRewrites),
+            "delta.writePartitionColumnsToParquet" => Ok(Self::WritePartitionColumnsToParquet),
             _ => Err(DeltaTableError::Generic("unknown config key".into())),
         }
     }

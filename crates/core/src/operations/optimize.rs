@@ -44,7 +44,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use tracing::*;
 
 use crate::datafile::DeltaWriterProperties;
-use crate::datafile::properties::OPTIMIZE_PARQUET_PROPERTIES;
+use crate::datafile::properties::{OPTIMIZE_PARQUET_PROPERTIES, materialize_partition_columns};
 use crate::datafile::writer::{
     ArrowWriterOptions, PartitionWriter, PartitionWriterConfig, UploadBudget,
 };
@@ -1044,10 +1044,12 @@ pub async fn create_merge_plan(
     };
     // Write the types the rewrite scan produces (e.g. view types), so batches need no cast
     let scan_config = DeltaScanConfig::new_from_session(&session);
-    let file_schema = arrow_schema_without_partitions(
-        &scan_config.table_schema(snapshot.table_configuration())?,
-        partitions_keys,
-    );
+    let table_schema = scan_config.table_schema(snapshot.table_configuration())?;
+    let file_schema = if materialize_partition_columns(snapshot.table_configuration()) {
+        table_schema
+    } else {
+        arrow_schema_without_partitions(&table_schema, partitions_keys)
+    };
 
     Ok(MergePlan {
         operations,

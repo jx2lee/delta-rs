@@ -336,6 +336,9 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
         writer_features.insert(TableFeature::CheckConstraints);
         writer_features.insert(TableFeature::GeneratedColumns);
         writer_features.insert(TableFeature::ColumnMapping);
+        // The DataFusion write paths (write, merge, update, delete, optimize) keep the
+        // partition columns in the data files when the table requires it.
+        writer_features.insert(TableFeature::MaterializePartitionColumns);
     }
     writer_features.insert(TableFeature::DeletionVectors);
     // writer_features.insert(TableFeature::IdentityColumns);

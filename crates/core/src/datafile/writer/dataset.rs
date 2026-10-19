@@ -38,6 +38,9 @@ pub struct WriterConfig {
     /// [`UploadBudget`] for closed files still uploading. Every writer built from this
     /// config, or from a clone of it, shares it.
     upload_budget: UploadBudget,
+    /// Keep the partition columns in the data files (`materializePartitionColumns`,
+    /// `icebergCompatV1/V2`, `delta.writePartitionColumnsToParquet`) instead of stripping them.
+    materialize_partition_columns: bool,
 }
 
 impl WriterConfig {
@@ -54,7 +57,15 @@ impl WriterConfig {
             path_prefix: None,
             upload_budget: UploadBudget::for_write(writer_properties.target_file_size()),
             writer_properties,
+            materialize_partition_columns: false,
         }
+    }
+
+    /// Also write the partition columns into every data file, with the value the file's
+    /// `partitionValues` carry. Stats are still not collected for them.
+    pub fn with_materialize_partition_columns(mut self, materialize: bool) -> Self {
+        self.materialize_partition_columns = materialize;
+        self
     }
 
     /// Write every data file below `prefix` under the table root, so the returned
@@ -80,6 +91,9 @@ impl WriterConfig {
 
     /// Schema of files written to disk
     pub fn file_schema(&self) -> ArrowSchemaRef {
+        if self.materialize_partition_columns {
+            return self.table_schema.clone();
+        }
         arrow_schema_without_partitions(&self.table_schema, &self.partition_columns)
     }
 }
@@ -195,8 +209,11 @@ impl DeltaWriter {
         partition_values: &IndexMap<String, Scalar>,
     ) -> DeltaResult<()> {
         let key = Path::parse(partition_values.hive_partition_path())?;
-        let record_batch =
-            record_batch_without_partitions(&record_batch, &self.config.partition_columns)?;
+        let record_batch = if self.config.materialize_partition_columns {
+            record_batch
+        } else {
+            record_batch_without_partitions(&record_batch, &self.config.partition_columns)?
+        };
         self.write_keyed(key, &record_batch, || partition_values.clone())
             .await
     }

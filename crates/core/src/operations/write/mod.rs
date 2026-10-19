@@ -863,6 +863,93 @@ mod tests {
         assert_eq!(parquet_columns, physical_names);
     }
 
+    /// Column names of the parquet file at `path`, in file order.
+    async fn data_file_columns(table: &DeltaTable, path: &object_store::path::Path) -> Vec<String> {
+        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
+            table.log_store().object_store(),
+            path.clone(),
+        );
+        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap();
+        builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// With `materializePartitionColumns` supported, write and optimize keep the partition
+    /// columns in the data files, collect no stats for them, and reads still see each column once.
+    #[tokio::test]
+    async fn test_materialize_partition_columns_keeps_partition_columns_in_data_files() {
+        let table = DeltaTable::new_in_memory()
+            .write(vec![get_record_batch(None, false)])
+            .with_partition_columns(["modified"])
+            .await
+            .unwrap();
+        for file in table.snapshot().unwrap().log_data().iter() {
+            let columns = data_file_columns(&table, &file.object_store_path()).await;
+            assert_eq!(columns, ["id", "value"]);
+        }
+
+        let table = table
+            .add_feature()
+            .with_feature(crate::kernel::TableFeatures::MaterializePartitionColumns)
+            .with_allow_protocol_versions_increase(true)
+            .await
+            .unwrap();
+        let table = table
+            .write(vec![get_record_batch(None, false)])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        // compaction rewrites the pre-feature files too, so every file ends up materialized
+        let (table, metrics) = table.optimize().await.unwrap();
+        assert_eq!(metrics.num_files_removed, 4);
+        assert_eq!(metrics.num_files_added, 2);
+
+        let files: Vec<_> = table.snapshot().unwrap().log_data().iter().collect();
+        assert_eq!(files.len(), 2);
+        for file in &files {
+            let columns = data_file_columns(&table, &file.object_store_path()).await;
+            assert_eq!(columns, ["id", "value", "modified"]);
+            let stats: Value = serde_json::from_str(&file.stats().unwrap()).unwrap();
+            assert!(stats["numRecords"].as_i64().unwrap() > 0);
+            assert!(stats["minValues"].get("id").is_some());
+            assert!(stats["minValues"].get("modified").is_none(), "{stats}");
+            assert!(stats["nullCount"].get("modified").is_none(), "{stats}");
+        }
+
+        let data = get_data(&table).await;
+        assert_eq!(data[0].schema().fields().len(), 3);
+        assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 22);
+    }
+
+    /// `delta.writePartitionColumnsToParquet` materializes without a writer feature.
+    #[tokio::test]
+    async fn test_write_partition_columns_to_parquet_property() {
+        let table = DeltaTable::new_in_memory()
+            .write(vec![get_record_batch(None, false)])
+            .with_partition_columns(["modified"])
+            .with_configuration([("delta.writePartitionColumnsToParquet", Some("true"))])
+            .await
+            .unwrap();
+        for file in table.snapshot().unwrap().log_data().iter() {
+            let columns = data_file_columns(&table, &file.object_store_path()).await;
+            assert_eq!(columns, ["id", "value", "modified"]);
+        }
+        assert_eq!(
+            get_data(&table)
+                .await
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>(),
+            11
+        );
+    }
+
     #[tokio::test]
     async fn test_create_write() {
         let table_schema = get_delta_schema();
