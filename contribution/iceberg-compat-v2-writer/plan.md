@@ -2,7 +2,8 @@
 
 - 대상: `delta.enableIcebergCompatV2 = true` 인 테이블을 delta-rs 가 **스펙대로 쓰게** 만든다. Iceberg 메타데이터 생성은 범위 밖이다(스펙도 "이 기능은 변환을 구현하지 않는다" 고 적어 둠).
 - 근거 스펙: `delta-io/delta` master `PROTOCOL.md` 의 "Iceberg Compatibility V2", "Materialize Partition Columns", `delta.writePartitionColumnsToParquet` 속성 설명(2026-10-19 확인).
-- 검증: upstream main `f67f1210`(2026-10-19) 에 아래 3 개 PR 을 한 번에 적용해 돌려 봤다. 적용한 diff 전체는 `prototype.diff`, 결과는 7 절.
+- 검증: upstream main `f67f1210`(2026-10-19) 에 아래 PR 들을 한 번에 적용해 돌려 봤다. 적용한 diff 전체는 `prototype.diff`, 결과는 7 절. Spark UniForm 으로 Iceberg 메타데이터를 만들고 pyiceberg 로 읽는 통합 검증은 `plan-integration.md`.
+- 통합 검증에서 찾은 문제 둘을 고쳤다: 재작성 파일의 `ARROW:schema` 에 view 타입이 들어가는 main 의 버그(**PR 0**, Iceberg 와 무관) 와 Spark 의 `ICEBERG_COMPAT_VERSION` tag(PR 3 에 포함). `plan-integration.md` 3 절.
 - V1 은 하지 않는다(4 절).
 
 ## 0. 한 줄 결론
@@ -101,6 +102,8 @@ arrow-rs parquet writer 는 list element·map key/value Field 의 `PARQUET:field
 | `operations/create.rs` | `ensure_iceberg_compat_v2_types`: Void·Variant·(nanos timestamp) 거부, 중첩 타입 재귀 |
 | `operations/set_tbl_properties.rs` | V2 를 나중에 켜는 것은 거부. nested id 는 create 때만 할당하기 때문 |
 
+여기에 `datafile/properties.rs` 의 `DeltaWriterProperties.file_tags` 가 더해진다. V2 테이블이면 `apply_table_stats` 가 `{"ICEBERG_COMPAT_VERSION": "2"}` 를 채우고 `PartitionWriter` 가 모든 `add` 에 단다. Spark 가 같은 tag 로 "V2 로 쓴 파일" 을 구분하기 때문이다(`plan-integration.md` 3-2).
+
 V1 은 넣지 않는다. V1 은 Map/Array 자체를 금지하고, DV 가 protocol 에 아예 없어야 하고, 파티션 컬럼을 데이터 컬럼 뒤에 둬야 한다. Spark 도 V2 를 권장한다. `delta.enableIcebergCompatV1` 키는 파싱만 되고(A 안) `true` 면 V2 와 충돌 에러만 낸다. V1 단독 `true` 는 현재 아무 효과가 없는데, PR 3 에서 "not supported" 에러로 바꾸는 편이 낫다(미구현).
 
 테스트: 위 PR 2 테이블에서 protocol 이 writer 7 + `icebergCompatV2` + `columnMapping` 인지, `is_feature_enabled` 가 true 인지, `PROTOCOL.can_write_to` 가 통과하는지, 데이터 파일에 파티션 컬럼 `p` 가 물리 이름으로 들어가고 stats 에는 없는지. 거부 케이스 4 개(CM 없음, +DV, +V1, Variant 타입).
@@ -112,6 +115,8 @@ V1 은 넣지 않는다. V1 은 Map/Array 자체를 금지하고, DV 가 protoco
 - 기존 CM 테이블에 V2 를 나중에 켜는 것은 막는다(nested id 없음). 풀려면 schema metadata 를 다시 쓰는 별도 작업이 필요하다.
 - legacy `RecordBatchWriter`/`JsonWriter` 는 materialize 테이블을 거부한다. 지원하려면 `writer/record_batch.rs:308` 근처 `WriteWindow` 에 같은 플래그가 필요하다.
 - kernel 이 나중에 V2 validator 를 추가하면 PR 3 의 검증과 겹친다. PR 3 은 얇게 유지하고 본문에 적어 둔다.
+- column mapping 테이블에서는 delta-rs `OPTIMIZE` 가 `UnsupportedColumnMapping` 으로 거부된다(기존 guard). V2 는 CM 이 필수라 V2 테이블도 delta-rs 로 compaction 할 수 없다. V2 와 별개의 기능이므로 known limitation 으로만 적는다.
+- Iceberg 메타데이터는 Spark 가 커밋할 때만 갱신된다(UniForm 의 성질).
 
 ## 6. 진행 순서
 
@@ -123,10 +128,10 @@ V1 은 넣지 않는다. V1 은 Map/Array 자체를 금지하고, DV 가 protoco
 
 `prototype.diff` 를 적용한 상태에서:
 
-- 새 테스트 4 개 통과: `test_materialize_partition_columns_keeps_partition_columns_in_data_files`, `test_write_partition_columns_to_parquet_property`, `test_iceberg_compat_v2_writes_nested_field_ids`, `test_iceberg_compat_v2_rejects_unsupported_configuration` (모두 `crates/core/src/operations/write/mod.rs`).
-- 기존 테스트: `cargo test -p deltalake-core --features datafusion --lib` 1358 통과(2 ignored), `--test it_datafusion` 167 통과(8 ignored), `--test it` 49 통과.
+- 새 테스트 6 개 통과: `test_materialize_partition_columns_keeps_partition_columns_in_data_files`, `test_write_partition_columns_to_parquet_property`, `test_iceberg_compat_v2_writes_nested_field_ids`, `test_iceberg_compat_v2_rejects_unsupported_configuration` (`crates/core/src/operations/write/mod.rs`), `test_delete_rewrites_file_with_plain_types_in_arrow_schema` (`operations/delete.rs`), `without_view_types_replaces_in_memory_types_everywhere` (`datafile/writer/file.rs`).
+- 기존 테스트: `cargo test -p deltalake-core --features datafusion --lib` 1360 통과(2 ignored), `--test it_datafusion` 167 통과, `--test it` 49 통과. `command_optimize` 의 테스트 2 개는 PR 0 때문에 `StringViewArray` → `StringArray` 로 고쳤다(`plan-integration.md` 3-1).
 - `cargo fmt`, `cargo clippy -p deltalake-core --features datafusion --tests` 에서 수정 파일 경고 없음.
-- Iceberg 리더로 실제로 읽어 보지는 않았다(pyiceberg/Spark 환경 없음). 스펙의 각 항목을 parquet 메타데이터와 로그로 확인한 것까지다.
+- Iceberg 리더 검증: Delta Spark 4.4.1 이 이 테이블에서 Iceberg 메타데이터를 만들었고 pyiceberg 0.12 가 읽었다. field id·파티션·중첩 타입 전부 일치. 양방향(Spark 가 쓰고 delta-rs 가 읽고 쓰기)도 확인. 자세한 것은 `plan-integration.md`.
 
 ## 8. 실행
 
@@ -139,4 +144,4 @@ cargo clippy -p deltalake-core --features datafusion --tests
 cargo test -p deltalake-core --features datafusion --lib -- operations::write::tests::test_materialize operations::write::tests::test_iceberg_compat_v2 operations::write::tests::test_write_partition_columns
 ```
 
-PR 별로 나눌 때는 diff 를 파일 단위로 갈라 쓴다. PR 1: `properties.rs`, `dataset.rs`, `execution.rs`, `optimize.rs`, `writer/mod.rs`, `protocol.rs` 의 `MaterializePartitionColumns`, `config.rs` 의 `WritePartitionColumnsToParquet`. PR 2: `column_mapping.rs`, `create.rs` 의 nested id, `config.rs` 의 Iceberg variant 3 개. PR 3: 나머지.
+PR 별로 나눌 때는 diff 를 파일 단위로 갈라 쓴다. PR 0: `datafile/writer/file.rs`, `datafile/writer/parallel.rs`, `operations/delete.rs` 의 테스트, `tests/it_datafusion/command_optimize.rs`. PR 1: `properties.rs` 의 `materialize_partition_columns`, `dataset.rs`, `execution.rs`, `optimize.rs`, `writer/mod.rs`, `protocol.rs` 의 `MaterializePartitionColumns`, `config.rs` 의 `WritePartitionColumnsToParquet`. PR 2: `column_mapping.rs`, `create.rs` 의 nested id, `config.rs` 의 Iceberg variant 3 개. PR 3: 나머지(`properties.rs` 의 `file_tags` 와 `partition.rs` 포함).

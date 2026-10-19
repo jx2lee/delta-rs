@@ -1,8 +1,14 @@
 diff --git a/crates/core/src/datafile/properties.rs b/crates/core/src/datafile/properties.rs
-index 29b81ff7..acafe20e 100644
+index 29b81ff7..5fc08b08 100644
 --- a/crates/core/src/datafile/properties.rs
 +++ b/crates/core/src/datafile/properties.rs
-@@ -12,6 +12,7 @@ use std::num::NonZeroU64;
+@@ -7,11 +7,13 @@
+ //! [`ReaderProperties`] is the read-side counterpart: it builds DataFusion's
+ //! [`TableParquetOptions`](datafusion::config::TableParquetOptions) for Delta scans.
+ 
++use std::collections::HashMap;
+ use std::fmt::Debug;
+ use std::num::NonZeroU64;
  use std::sync::LazyLock;
  
  use delta_kernel::table_configuration::TableConfiguration;
@@ -10,7 +16,7 @@ index 29b81ff7..acafe20e 100644
  use delta_kernel::table_properties::DataSkippingNumIndexedCols;
  use parquet::basic::Compression;
  use parquet::file::properties::WriterProperties;
-@@ -20,7 +21,7 @@ use crate::datafile::writer::ArrowWriterOptions;
+@@ -20,7 +22,7 @@ use crate::datafile::writer::ArrowWriterOptions;
  use crate::errors::DeltaResult;
  use crate::kernel::arrow::engine_ext::stats_table_properties;
  use crate::parquet_utils::default_writer_properties;
@@ -19,7 +25,7 @@ index 29b81ff7..acafe20e 100644
  
  /// Rows per slice handed to the parquet writer when none is set.
  pub(crate) const DEFAULT_WRITE_BATCH_SIZE: usize = 8192;
-@@ -143,6 +144,20 @@ impl WriterStatsConfig {
+@@ -143,6 +145,20 @@ impl WriterStatsConfig {
      }
  }
  
@@ -40,6 +46,45 @@ index 29b81ff7..acafe20e 100644
  /// Everything that shapes a Delta data file.
  ///
  /// Unset fields fall back to delta-rs defaults, or to the table's where an
+@@ -162,6 +178,8 @@ pub struct DeltaWriterProperties {
+     pub(crate) write_batch_size: Option<usize>,
+     /// Which columns get data-skipping stats. Unset, operations use the table's.
+     pub(crate) stats: Option<WriterStatsConfig>,
++    /// `tags` every `add` action gets ([`Self::apply_table_file_tags`]).
++    pub(crate) file_tags: Option<HashMap<String, Option<String>>>,
+ }
+ 
+ impl DeltaWriterProperties {
+@@ -187,6 +205,7 @@ impl DeltaWriterProperties {
+             target_file_size: overrides.target_file_size.or(self.target_file_size),
+             write_batch_size: overrides.write_batch_size.or(self.write_batch_size),
+             stats: overrides.stats.or(self.stats),
++            file_tags: overrides.file_tags.or(self.file_tags),
+         }
+     }
+ 
+@@ -235,6 +254,21 @@ impl DeltaWriterProperties {
+         if self.stats.is_none() {
+             self.stats = Some(WriterStatsConfig::from_config(table_config));
+         }
++        self.apply_table_file_tags(table_config)
++    }
++
++    /// Tag the data files the way Delta Spark does on an `icebergCompatV2` table
++    /// (`ICEBERG_COMPAT_VERSION`), so its `REORG TABLE ... APPLY (UPGRADE UNIFORM)` leaves
++    /// them alone instead of rewriting every file that lacks the tag. Not in PROTOCOL.md.
++    fn apply_table_file_tags(mut self, table_config: &TableConfiguration) -> Self {
++        if self.file_tags.is_none()
++            && table_config.is_feature_enabled(&TableFeature::IcebergCompatV2)
++        {
++            self.file_tags = Some(HashMap::from([(
++                "ICEBERG_COMPAT_VERSION".to_string(),
++                Some("2".to_string()),
++            )]));
++        }
+         self
+     }
+ 
 diff --git a/crates/core/src/datafile/writer/dataset.rs b/crates/core/src/datafile/writer/dataset.rs
 index 85c2e044..c8bbad8f 100644
 --- a/crates/core/src/datafile/writer/dataset.rs
@@ -96,6 +141,183 @@ index 85c2e044..c8bbad8f 100644
          self.write_keyed(key, &record_batch, || partition_values.clone())
              .await
      }
+diff --git a/crates/core/src/datafile/writer/file.rs b/crates/core/src/datafile/writer/file.rs
+index 2c19c0e0..228c0bce 100644
+--- a/crates/core/src/datafile/writer/file.rs
++++ b/crates/core/src/datafile/writer/file.rs
+@@ -4,12 +4,13 @@
+ use std::sync::{Arc, OnceLock};
+ 
+ use arrow_array::RecordBatch;
++use arrow_schema::{DataType, Field, Fields, Schema};
+ use bytes::Bytes;
+ use futures::future::BoxFuture;
+ use object_store::buffered::BufWriter;
+ use object_store::path::Path;
+-use parquet::arrow::AsyncArrowWriter;
+ use parquet::arrow::async_writer::AsyncFileWriter;
++use parquet::arrow::{AsyncArrowWriter, add_encoded_arrow_schema_to_metadata};
+ use parquet::errors::{ParquetError, Result as ParquetResult};
+ use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+ use tokio::io::AsyncWriteExt as _;
+@@ -136,6 +137,34 @@ impl AsyncFileWriter for ParquetObjectWriter {
+     }
+ }
+ 
++/// `schema` with the in-memory-only types replaced by the types the Delta schema maps to:
++/// `Utf8View`/`BinaryView` by `Utf8`/`Binary`, a dictionary by its value type. The parquet
++/// encoding is the same either way; only the `ARROW:schema` footer differs.
++fn without_view_types(schema: &Schema) -> Schema {
++    fn field(field: &Field) -> Field {
++        Field::new(
++            field.name(),
++            data_type(field.data_type()),
++            field.is_nullable(),
++        )
++        .with_metadata(field.metadata().clone())
++    }
++    fn data_type(dt: &DataType) -> DataType {
++        match dt {
++            DataType::Utf8View => DataType::Utf8,
++            DataType::BinaryView => DataType::Binary,
++            DataType::Dictionary(_, value) => data_type(value),
++            DataType::List(inner) => DataType::List(Arc::new(field(inner))),
++            DataType::LargeList(inner) => DataType::LargeList(Arc::new(field(inner))),
++            DataType::Map(inner, sorted) => DataType::Map(Arc::new(field(inner)), *sorted),
++            DataType::Struct(fields) => DataType::Struct(fields.iter().map(|f| field(f)).collect()),
++            other => other.clone(),
++        }
++    }
++    let fields: Fields = schema.fields().iter().map(|f| field(f)).collect();
++    Schema::new_with_metadata(fields, schema.metadata().clone())
++}
++
+ /// The parquet writer of one file: its columns encoded in parallel, or one after another
+ /// by arrow-rs. Chosen by [`ArrowWriterOptions::with_enable_parallel_encoding`].
+ pub(super) enum FileArrowWriter {
+@@ -146,27 +175,29 @@ pub(super) enum FileArrowWriter {
+ impl FileArrowWriter {
+     fn try_new(writer: ParquetObjectWriter, config: &PartitionWriterConfig) -> ParquetResult<Self> {
+         let options = config.writer_properties.arrow_options();
++        let mut props = config
++            .writer_properties
++            .parquet_properties_or_default()
++            .clone();
++        // The `ARROW:schema` footer is written here, from the schema a scan-free reader
++        // expects, instead of by the arrow writer: batches that come from a DataFusion scan
++        // carry view and dictionary types, and a reader restoring those from the footer
++        // (pyarrow, pyiceberg) cannot combine such files with files written from plain types.
++        if !options.skip_arrow_metadata() {
++            add_encoded_arrow_schema_to_metadata(
++                &without_view_types(&config.file_schema),
++                &mut props,
++            );
++        }
++        let options = options.clone().with_skip_arrow_metadata(true);
+         if options.enable_parallel_encoding() {
+-            ParallelArrowWriter::try_new(
+-                writer,
+-                config.file_schema.clone(),
+-                config
+-                    .writer_properties
+-                    .parquet_properties_or_default()
+-                    .clone(),
+-                Some(options.clone()),
+-            )
+-            .map(Self::Parallel)
++            ParallelArrowWriter::try_new(writer, config.file_schema.clone(), props, Some(options))
++                .map(Self::Parallel)
+         } else {
+             AsyncArrowWriter::try_new_with_options(
+                 writer,
+                 config.file_schema.clone(),
+-                options.to_parquet_options(
+-                    config
+-                        .writer_properties
+-                        .parquet_properties_or_default()
+-                        .clone(),
+-                ),
++                options.to_parquet_options(props),
+             )
+             .map(Self::Serial)
+         }
+@@ -352,3 +383,46 @@ impl LazyArrowWriter {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn without_view_types_replaces_in_memory_types_everywhere() {
++        let dict = DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
++        let schema = Schema::new(vec![
++            Field::new("s", DataType::Utf8View, true),
++            Field::new("b", DataType::BinaryView, true),
++            Field::new("p", dict.clone(), true),
++            Field::new(
++                "l",
++                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
++                true,
++            ),
++            Field::new(
++                "st",
++                DataType::Struct(vec![Field::new("inner", dict, true)].into()),
++                true,
++            ),
++            Field::new("i", DataType::Int32, false),
++        ]);
++        let expected = Schema::new(vec![
++            Field::new("s", DataType::Utf8, true),
++            Field::new("b", DataType::Binary, true),
++            Field::new("p", DataType::Utf8, true),
++            Field::new(
++                "l",
++                DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
++                true,
++            ),
++            Field::new(
++                "st",
++                DataType::Struct(vec![Field::new("inner", DataType::Utf8, true)].into()),
++                true,
++            ),
++            Field::new("i", DataType::Int32, false),
++        ]);
++        assert_eq!(without_view_types(&schema), expected);
++    }
++}
+diff --git a/crates/core/src/datafile/writer/parallel.rs b/crates/core/src/datafile/writer/parallel.rs
+index 83c1d931..d8a2f606 100644
+--- a/crates/core/src/datafile/writer/parallel.rs
++++ b/crates/core/src/datafile/writer/parallel.rs
+@@ -88,6 +88,10 @@ impl ArrowWriterOptions {
+         self.enable_parallel_encoding
+     }
+ 
++    pub(crate) fn skip_arrow_metadata(&self) -> bool {
++        self.skip_arrow_metadata_hint
++    }
++
+     /// The same settings as parquet's own options, for `AsyncArrowWriter`.
+     pub(crate) fn to_parquet_options(
+         &self,
+diff --git a/crates/core/src/datafile/writer/partition.rs b/crates/core/src/datafile/writer/partition.rs
+index 63d351ac..b988f5d3 100644
+--- a/crates/core/src/datafile/writer/partition.rs
++++ b/crates/core/src/datafile/writer/partition.rs
+@@ -385,6 +385,10 @@ impl PartitionWriter {
+                 .map_err(|err| WriteError::CreateAdd {
+                     source: Box::new(err),
+                 })
++                .map(|add| Add {
++                    tags: self.config.writer_properties.file_tags.clone(),
++                    ..add
++                })
+             })
+             .collect::<Result<Vec<_>, _>>()?;
+ 
 diff --git a/crates/core/src/delta_datafusion/column_mapping.rs b/crates/core/src/delta_datafusion/column_mapping.rs
 index d1e82791..e866e816 100644
 --- a/crates/core/src/delta_datafusion/column_mapping.rs
@@ -445,6 +667,48 @@ index a813b0ad..6d85f3d6 100644
              configuration.insert(
                  "delta.columnMapping.maxColumnId".to_string(),
                  max_id.to_string(),
+diff --git a/crates/core/src/operations/delete.rs b/crates/core/src/operations/delete.rs
+index d5c268ea..0d8b02f2 100644
+--- a/crates/core/src/operations/delete.rs
++++ b/crates/core/src/operations/delete.rs
+@@ -2274,6 +2274,37 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn test_delete_rewrites_file_with_plain_types_in_arrow_schema() -> DeltaResult<()> {
++        // The rewrite scan yields Utf8View (and dictionaries for partition columns); the
++        // file's ARROW:schema must still say Utf8, like a file written from plain batches,
++        // or pyarrow-based readers cannot combine the two kinds of file.
++        let schema = Arc::new(Schema::new(vec![
++            Field::new("name", DataType::Utf8, false),
++            Field::new("value", DataType::Int32, false),
++        ]));
++        let batch = RecordBatch::try_new(
++            Arc::clone(&schema),
++            vec![
++                Arc::new(StringArray::from(vec!["alice", "bob"])),
++                Arc::new(Int32Array::from(vec![1, 2])),
++            ],
++        )?;
++        let table = DeltaTable::new_in_memory().write(vec![batch]).await?;
++        let (table, _) = table.delete().with_predicate("name = 'bob'").await?;
++
++        let files = table.get_files_by_partitions(&[]).await?;
++        assert_eq!(files.len(), 1);
++        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
++            table.log_store().object_store(),
++            files[0].clone(),
++        );
++        let builder =
++            parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await?;
++        assert_eq!(builder.schema().as_ref(), schema.as_ref());
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn test_delete_custom_session_schema_force_view_types_disabled() -> DeltaResult<()> {
+         // Integration guardrail: user-supplied DataFusion sessions may disable view types.
 diff --git a/crates/core/src/operations/optimize.rs b/crates/core/src/operations/optimize.rs
 index 653e1b2b..b85adcdd 100644
 --- a/crates/core/src/operations/optimize.rs
@@ -566,7 +830,7 @@ index 3854d869..df880693 100644
      // Keep the previous single-writer fan-in path for unpartitioned tables.
      if partition_columns.is_empty() {
 diff --git a/crates/core/src/operations/write/mod.rs b/crates/core/src/operations/write/mod.rs
-index 070b105c..344f6559 100644
+index 070b105c..cc473351 100644
 --- a/crates/core/src/operations/write/mod.rs
 +++ b/crates/core/src/operations/write/mod.rs
 @@ -670,6 +670,7 @@ mod tests {
@@ -585,7 +849,7 @@ index 070b105c..344f6559 100644
      use futures::TryStreamExt;
      use itertools::Itertools;
      use serde_json::{Value, json};
-@@ -863,6 +865,369 @@ mod tests {
+@@ -863,6 +865,374 @@ mod tests {
          assert_eq!(parquet_columns, physical_names);
      }
  
@@ -841,6 +1105,11 @@ index 070b105c..344f6559 100644
 +        let stats: Value = serde_json::from_str(&file.stats().unwrap()).unwrap();
 +        assert_eq!(stats["numRecords"], 2);
 +        assert!(stats["nullCount"].get(&p_phys).is_none(), "{stats}");
++        // tagged like Delta Spark tags its files, so its UniForm upgrade keeps them
++        assert_eq!(
++            file.add_action().tags.unwrap()["ICEBERG_COMPAT_VERSION"].as_deref(),
++            Some("2")
++        );
 +        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
 +            table.log_store().object_store(),
 +            files[0].clone(),
@@ -1023,3 +1292,25 @@ index b18976f0..38fa8d6c 100644
  
      Ok(())
  }
+diff --git a/crates/core/tests/it_datafusion/command_optimize.rs b/crates/core/tests/it_datafusion/command_optimize.rs
+index 1d3570db..cc5da9f9 100644
+--- a/crates/core/tests/it_datafusion/command_optimize.rs
++++ b/crates/core/tests/it_datafusion/command_optimize.rs
+@@ -1929,7 +1929,7 @@ async fn test_zorder_unpartitioned() -> Result<(), Box<dyn Error>> {
+         vec![
+             Arc::new(Int32Array::from(vec![1, 2, 1, 1, 1, 2])),
+             Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 2])),
+-            Arc::new(StringViewArray::from(vec![
++            Arc::new(StringArray::from(vec![
+                 "1970-01-01",
+                 "1970-01-04",
+                 "1970-01-01",
+@@ -2285,7 +2285,7 @@ async fn test_optimize_spark_written_nullable_nested_field() -> Result<(), Box<d
+         .column_by_name("int_id")
+         .unwrap()
+         .as_any()
+-        .downcast_ref::<arrow_array::StringViewArray>()
++        .downcast_ref::<arrow_array::StringArray>()
+         .unwrap();
+     let mut actual: Vec<&str> = int_id_col.iter().map(|v| v.expect("non-null")).collect();
+     actual.sort_unstable();

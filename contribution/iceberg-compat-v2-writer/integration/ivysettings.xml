@@ -1,0 +1,8 @@
+<!-- Only Maven Central: a ~/.m2 with poms but no jars makes Spark's default ivy chain fail with "download failed". -->
+<ivysettings>
+  <settings defaultResolver="central"/>
+  <caches defaultCacheDir="${ivy.settings.dir}/ivy-cache"/>
+  <resolvers>
+    <ibiblio name="central" m2compatible="true" root="https://repo1.maven.org/maven2/"/>
+  </resolvers>
+</ivysettings>

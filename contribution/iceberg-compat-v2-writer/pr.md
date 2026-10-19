@@ -1,8 +1,49 @@
-Three PRs, in order. Ask on #3299 first (see `plan.md` section 6).
+Four PRs, in order. PR 0 is independent of Iceberg (file an issue first); ask on #3299 before PR 1–3 (see `plan.md` section 6).
 
-Verified locally on upstream main `f67f1210` (2026-10-19) with all three applied: 4 new tests, `deltalake-core` lib (1358) / `it_datafusion` (167) / `it` (49) suites, fmt, clippy. Not verified: reading the resulting table with an Iceberg reader.
+Verified locally on upstream main `f67f1210` (2026-10-19) with all four applied: 6 new tests, `deltalake-core` lib (1360) / `it_datafusion` (167) / `it` (49) suites, fmt, clippy. Iceberg reader: Delta Spark 4.4.1 UniForm converted the table and pyiceberg 0.12 read it back, both directions (`plan-integration.md`).
 
 ---
+
+## PR 0
+
+- Issue first (title draft): `delete/update/merge/optimize write view and dictionary types into the parquet ARROW:schema`
+- Branch: `jx2lee/fix/arrow-schema-view-types`
+- Title: `fix: write plain arrow types into the parquet ARROW:schema footer`
+
+````markdown
+# Description
+
+Files rewritten by delete, update, merge and optimize carry the DataFusion scan types in their
+`ARROW:schema` footer: `Utf8View`/`BinaryView` for strings and binaries, and a dictionary for a
+partition column that is kept in the file. Files written by `write` carry `Utf8`. The parquet
+encoding is identical, but a reader that restores the footer (pyarrow, and pyiceberg on top of
+it) gets `string_view` from one file and `string` from the next and cannot combine them:
+
+    ArrowTypeError: Unable to merge: Field name has incompatible types: string vs string_view
+
+and filters on a single rewritten file fail with `Function 'array_filter' has no kernel
+matching input types (string_view, bool)`. #4579 reported the same symptom; #4589 fixed the
+compression part only.
+
+`FileArrowWriter::try_new` now writes the footer itself, from the file schema with
+`Utf8View → Utf8`, `BinaryView → Binary` and dictionaries replaced by their value type
+(`without_view_types`), and asks the arrow writer to skip its own. Batches are not cast.
+Both the parallel and the serial writer go through this.
+
+Two optimize tests downcast the read-back column to `StringViewArray`; they now expect
+`StringArray`, which is what a file written by `write` already gave.
+
+Verified by hand: pyiceberg could not scan a table after a delta-rs delete and can after this
+change (`contribution/iceberg-compat-v2-writer/plan-integration.md` in my fork has the steps).
+
+# Related Issue(s)
+
+- closes #<new issue>
+
+# Documentation
+
+N/A
+````
 
 ## PR 1
 
@@ -89,9 +130,20 @@ requirements of `icebergCompatV2`, so this PR turns the property into the featur
 - `icebergCompatV2` is added to the supported writer features; `add_feature` knows the name.
 - Enabling the property on an existing table via `SET TBLPROPERTIES` is refused, because the
   nested ids are assigned to the schema at creation.
+- Every `add` gets `tags: {"ICEBERG_COMPAT_VERSION": "2"}`, the tag Delta Spark puts on files
+  it writes to such a table. Without it, Spark's `REORG TABLE ... APPLY (UPGRADE UNIFORM)`
+  rewrites every delta-rs file. Not in PROTOCOL.md; easy to drop if you prefer.
 
-Out of scope: `icebergCompatV1`, generating Iceberg metadata, the legacy writers. Kernel has a
-`TODO` for V1/V2 validation; the checks here are kept minimal so they can move there.
+Verified with Delta Spark 4.4.1: it accepts the table, its UniForm hook generates Iceberg
+metadata whose field ids are exactly the column-mapping and nested ids delta-rs assigned, the
+data files are registered in place, and pyiceberg reads them (nested types, decimals,
+timestamps, partition pruning). Spark can append to the table and delta-rs reads and writes it
+afterwards.
+
+Out of scope: `icebergCompatV1`, generating Iceberg metadata (only a Spark commit refreshes
+it), the legacy writers. Known limitation: `OPTIMIZE` on column-mapped tables is still refused
+by delta-rs, so it is on these tables too. Kernel has a `TODO` for V1/V2 validation; the checks
+here are kept minimal so they can move there.
 
 # Related Issue(s)
 
