@@ -329,7 +329,12 @@ impl CreateBuilder {
             // The guard above (field_has_column_mapping_metadata) rejects schemas that carry any
             // pre-existing CM annotations, so there are no existing ids to scan — start from 0.
             let mut max_id: i64 = 0;
-            let mapped = assign_column_mapping_metadata(&schema, &mut max_id, false)?;
+            // IcebergCompatV2 also needs parquet field ids for array elements and map keys/values
+            // (`delta.columnMapping.nested.ids`, PROTOCOL.md "Writer Requirements for IcebergCompatV2").
+            let nested_ids = configuration
+                .get(TableProperty::EnableIcebergCompatV2.as_ref())
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            let mapped = assign_column_mapping_metadata(&schema, &mut max_id, nested_ids)?;
             configuration.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
                 max_id.to_string(),

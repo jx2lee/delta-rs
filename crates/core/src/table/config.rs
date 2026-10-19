@@ -123,6 +123,17 @@ pub enum TableProperty {
     /// true for writers to also store partition column values in the data files, in the absence
     /// of a writer feature (`materializePartitionColumns`, `icebergCompatV1/V2`) that requires it.
     WritePartitionColumnsToParquet,
+
+    /// true to enable the `icebergCompatV1` writer feature (UniForm). Not supported by the
+    /// delta-rs writer; the key only parses so the property can be read.
+    EnableIcebergCompatV1,
+
+    /// true to enable the `icebergCompatV2` writer feature (UniForm): the data files can be
+    /// converted to Apache Iceberg (delta-rs does not generate the Iceberg metadata itself).
+    EnableIcebergCompatV2,
+
+    /// Formats to generate alongside Delta for UniForm, e.g. `iceberg`.
+    UniversalFormatEnabledFormats,
 }
 
 impl AsRef<str> for TableProperty {
@@ -153,6 +164,9 @@ impl AsRef<str> for TableProperty {
             Self::TargetFileSize => "delta.targetFileSize",
             Self::TuneFileSizesForRewrites => "delta.tuneFileSizesForRewrites",
             Self::WritePartitionColumnsToParquet => "delta.writePartitionColumnsToParquet",
+            Self::EnableIcebergCompatV1 => "delta.enableIcebergCompatV1",
+            Self::EnableIcebergCompatV2 => "delta.enableIcebergCompatV2",
+            Self::UniversalFormatEnabledFormats => "delta.universalFormat.enabledFormats",
         }
     }
 }
@@ -191,6 +205,9 @@ impl FromStr for TableProperty {
             "delta.targetFileSize" => Ok(Self::TargetFileSize),
             "delta.tuneFileSizesForRewrites" => Ok(Self::TuneFileSizesForRewrites),
             "delta.writePartitionColumnsToParquet" => Ok(Self::WritePartitionColumnsToParquet),
+            "delta.enableIcebergCompatV1" => Ok(Self::EnableIcebergCompatV1),
+            "delta.enableIcebergCompatV2" => Ok(Self::EnableIcebergCompatV2),
+            "delta.universalFormat.enabledFormats" => Ok(Self::UniversalFormatEnabledFormats),
             _ => Err(DeltaTableError::Generic("unknown config key".into())),
         }
     }

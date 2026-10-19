@@ -28,7 +28,8 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use delta_kernel::schema::{
-    DataType as KernelDataType, SchemaRef as KernelSchemaRef, StructField, StructType,
+    ColumnMetadataKey, DataType as KernelDataType, MetadataValue, SchemaRef as KernelSchemaRef,
+    StructField, StructType,
 };
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -336,6 +337,52 @@ fn metadata_without_field_id(field: &Field) -> HashMap<String, String> {
         .collect()
 }
 
+/// Parquet field ids of the synthetic `element` / `key` / `value` slots below one table field,
+/// from its `delta.columnMapping.nested.ids` metadata (assigned on IcebergCompatV2 tables). Keys
+/// are dot-paths rooted at the field's physical name, e.g. `col-aaa.value.element`.
+struct NestedFieldIds {
+    ids: HashMap<String, i64>,
+    /// Dot-path of the field being rebuilt.
+    path: String,
+}
+
+impl NestedFieldIds {
+    fn of(kernel_field: &StructField, mode: ColumnMappingMode) -> Self {
+        let ids = match kernel_field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds) {
+            Some(MetadataValue::Other(serde_json::Value::Object(map))) => map
+                .iter()
+                .filter_map(|(key, id)| Some((key.clone(), id.as_i64()?)))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        Self {
+            ids,
+            path: kernel_field.physical_name(mode).to_string(),
+        }
+    }
+
+    /// The ids seen from the `slot` (`element`, `key` or `value`) below the current path.
+    fn child(&self, slot: &str) -> NestedFieldIds {
+        NestedFieldIds {
+            ids: self.ids.clone(),
+            path: format!("{}.{slot}", self.path),
+        }
+    }
+
+    /// The field id of the current path, if the table assigned one.
+    fn id(&self) -> Option<i64> {
+        self.ids.get(&self.path).copied()
+    }
+
+    /// `metadata` with the current path's field id attached, when there is one.
+    fn attach(&self, mut metadata: HashMap<String, String>) -> HashMap<String, String> {
+        if let Some(id) = self.id() {
+            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+        }
+        metadata
+    }
+}
+
 /// Build the physical Arrow field for a single logical field: rename to the physical name,
 /// attach the table-owned `field_id` metadata, and recurse into nested types — all while
 /// preserving the input Arrow data type.
@@ -345,7 +392,8 @@ fn physical_field(field: &Field, kernel_field: &StructField, mode: ColumnMapping
     if let Some(id) = kernel_field.column_mapping_id() {
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
     }
-    let data_type = physical_data_type(field.data_type(), kernel_field.data_type(), mode);
+    let nested = NestedFieldIds::of(kernel_field, mode);
+    let data_type = physical_data_type(field.data_type(), kernel_field.data_type(), mode, &nested);
     Field::new(
         kernel_field.physical_name(mode),
         data_type,
@@ -362,6 +410,7 @@ fn physical_data_type(
     arrow_type: &DataType,
     kernel_type: &KernelDataType,
     mode: ColumnMappingMode,
+    nested: &NestedFieldIds,
 ) -> DataType {
     match kernel_type {
         KernelDataType::Struct(kernel_struct) => {
@@ -372,22 +421,24 @@ fn physical_data_type(
         }
         KernelDataType::Array(kernel_array) => {
             let element_kernel = kernel_array.element_type();
+            let nested = nested.child("element");
             match arrow_type {
                 DataType::List(element) => {
-                    DataType::List(rebuild_element(element, element_kernel, mode))
+                    DataType::List(rebuild_element(element, element_kernel, mode, &nested))
                 }
                 DataType::LargeList(element) => {
-                    DataType::LargeList(rebuild_element(element, element_kernel, mode))
+                    DataType::LargeList(rebuild_element(element, element_kernel, mode, &nested))
                 }
                 DataType::ListView(element) => {
-                    DataType::ListView(rebuild_element(element, element_kernel, mode))
+                    DataType::ListView(rebuild_element(element, element_kernel, mode, &nested))
                 }
                 DataType::LargeListView(element) => {
-                    DataType::LargeListView(rebuild_element(element, element_kernel, mode))
+                    DataType::LargeListView(rebuild_element(element, element_kernel, mode, &nested))
                 }
-                DataType::FixedSizeList(element, len) => {
-                    DataType::FixedSizeList(rebuild_element(element, element_kernel, mode), *len)
-                }
+                DataType::FixedSizeList(element, len) => DataType::FixedSizeList(
+                    rebuild_element(element, element_kernel, mode, &nested),
+                    *len,
+                ),
                 _ => arrow_type.clone(),
             }
         }
@@ -408,18 +459,28 @@ fn physical_data_type(
                 })
                 .collect();
             if let Some(key) = new_fields.get_mut(0) {
-                *key = key.clone().with_data_type(physical_data_type(
-                    key.data_type(),
-                    kernel_map.key_type(),
-                    mode,
-                ));
+                let nested = nested.child("key");
+                *key = key
+                    .clone()
+                    .with_data_type(physical_data_type(
+                        key.data_type(),
+                        kernel_map.key_type(),
+                        mode,
+                        &nested,
+                    ))
+                    .with_metadata(nested.attach(key.metadata().clone()));
             }
             if let Some(value) = new_fields.get_mut(1) {
-                *value = value.clone().with_data_type(physical_data_type(
-                    value.data_type(),
-                    kernel_map.value_type(),
-                    mode,
-                ));
+                let nested = nested.child("value");
+                *value = value
+                    .clone()
+                    .with_data_type(physical_data_type(
+                        value.data_type(),
+                        kernel_map.value_type(),
+                        mode,
+                        &nested,
+                    ))
+                    .with_metadata(nested.attach(value.metadata().clone()));
             }
             let new_entries = Field::new(
                 entries.name(),
@@ -439,11 +500,12 @@ fn rebuild_element(
     element: &Arc<Field>,
     element_kernel: &KernelDataType,
     mode: ColumnMappingMode,
+    nested: &NestedFieldIds,
 ) -> Arc<Field> {
-    let data_type = physical_data_type(element.data_type(), element_kernel, mode);
+    let data_type = physical_data_type(element.data_type(), element_kernel, mode, nested);
     Arc::new(
         Field::new(element.name(), data_type, element.is_nullable())
-            .with_metadata(metadata_without_field_id(element)),
+            .with_metadata(nested.attach(metadata_without_field_id(element))),
     )
 }
 

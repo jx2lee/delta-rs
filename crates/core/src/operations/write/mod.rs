@@ -927,6 +927,219 @@ mod tests {
         assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 22);
     }
 
+    /// Parquet `field_id`s below `node`, keyed by dot-path including the list/map wrapper groups
+    /// (e.g. `col-a.list.element`).
+    fn parquet_field_ids(
+        node: &parquet::schema::types::Type,
+        path: &str,
+        out: &mut HashMap<String, i32>,
+    ) {
+        let info = node.get_basic_info();
+        let path = if path.is_empty() {
+            info.name().to_string()
+        } else {
+            format!("{path}.{}", info.name())
+        };
+        if info.has_id() {
+            out.insert(path.clone(), info.id());
+        }
+        if let parquet::schema::types::Type::GroupType { fields, .. } = node {
+            for field in fields {
+                parquet_field_ids(field, &path, out);
+            }
+        }
+    }
+
+    /// An IcebergCompatV2 table assigns `delta.columnMapping.nested.ids` to array elements and
+    /// map keys/values, and the writer stores them in the parquet `field_id` of those nodes.
+    #[tokio::test]
+    async fn test_iceberg_compat_v2_writes_nested_field_ids() {
+        use arrow::array::{ListArray, StructArray, new_null_array};
+        use arrow::buffer::OffsetBuffer;
+        use delta_kernel::schema::{
+            ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, StructField,
+        };
+
+        let int_array =
+            || KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true)));
+        let columns = vec![
+            StructField::new("arr", int_array(), true),
+            StructField::new(
+                "m",
+                KernelDataType::Map(Box::new(MapType::new(
+                    KernelDataType::STRING,
+                    int_array(),
+                    true,
+                ))),
+                true,
+            ),
+            StructField::new(
+                "s",
+                KernelDataType::Struct(Box::new(
+                    StructType::try_new([StructField::new("inner", int_array(), true)]).unwrap(),
+                )),
+                true,
+            ),
+            StructField::new("p", KernelDataType::STRING, true),
+        ];
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(columns)
+            .with_partition_columns(["p"])
+            .with_configuration_property(TableProperty::ColumnMappingMode, Some("name"))
+            .with_configuration_property(TableProperty::EnableIcebergCompatV2, Some("true"))
+            .await
+            .unwrap();
+
+        let snapshot = table.snapshot().unwrap().snapshot();
+        let schema = snapshot.schema();
+        let nested_ids = |field: &StructField| -> HashMap<String, i64> {
+            match field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds) {
+                Some(MetadataValue::Other(Value::Object(ids))) => ids
+                    .iter()
+                    .map(|(key, id)| (key.clone(), id.as_i64().unwrap()))
+                    .collect(),
+                other => panic!("{}: expected nested ids, got {other:?}", field.name()),
+            }
+        };
+        let physical =
+            |field: &StructField| field.physical_name(ColumnMappingMode::Name).to_string();
+
+        let arr = schema.field("arr").unwrap();
+        let (arr_phys, arr_ids) = (physical(arr), nested_ids(arr));
+        assert_eq!(
+            arr_ids.keys().collect_vec(),
+            [&format!("{arr_phys}.element")]
+        );
+
+        let m = schema.field("m").unwrap();
+        let (m_phys, m_ids) = (physical(m), nested_ids(m));
+        assert_eq!(
+            m_ids.keys().sorted().collect_vec(),
+            [
+                &format!("{m_phys}.key"),
+                &format!("{m_phys}.value"),
+                &format!("{m_phys}.value.element")
+            ]
+        );
+
+        let s = schema.field("s").unwrap();
+        let s_phys = physical(s);
+        let KernelDataType::Struct(s_type) = s.data_type() else {
+            panic!("s is a struct")
+        };
+        let inner = s_type.field("inner").unwrap();
+        let (inner_phys, inner_ids) = (physical(inner), nested_ids(inner));
+        assert_eq!(
+            inner_ids.keys().collect_vec(),
+            [&format!("{inner_phys}.element")]
+        );
+
+        let p = schema.field("p").unwrap();
+
+        // 5 column-mapping ids (arr, m, s, inner, p) + 5 nested ids, all distinct
+        let all_ids: Vec<i64> = [arr, m, s, inner, p]
+            .iter()
+            .map(|f| f.column_mapping_id().unwrap())
+            .chain(arr_ids.values().copied())
+            .chain(m_ids.values().copied())
+            .chain(inner_ids.values().copied())
+            .collect();
+        assert_eq!(all_ids.iter().unique().count(), 10);
+        assert_eq!(
+            snapshot.metadata().configuration()["delta.columnMapping.maxColumnId"],
+            "10"
+        );
+
+        // write one file: arr and s carry data, m is all null, p is the partition value
+        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+        let DataType::List(arr_elem) = arrow_schema.field(0).data_type() else {
+            panic!("arr is a list")
+        };
+        let DataType::Struct(s_fields) = arrow_schema.field(2).data_type() else {
+            panic!("s is a struct")
+        };
+        let DataType::List(inner_elem) = s_fields[0].data_type() else {
+            panic!("inner is a list")
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(ListArray::new(
+                    arr_elem.clone(),
+                    OffsetBuffer::from_lengths([2, 1]),
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    None,
+                )),
+                new_null_array(arrow_schema.field(1).data_type(), 2),
+                Arc::new(StructArray::new(
+                    s_fields.clone(),
+                    vec![Arc::new(ListArray::new(
+                        inner_elem.clone(),
+                        OffsetBuffer::from_lengths([1, 2]),
+                        Arc::new(Int32Array::from(vec![4, 5, 6])),
+                        None,
+                    ))],
+                    None,
+                )),
+                Arc::new(StringArray::from(vec!["x", "x"])),
+            ],
+        )
+        .unwrap();
+        let table = table.write(vec![batch]).await.unwrap();
+
+        let files = table.get_files_by_partitions(&[]).await.unwrap();
+        assert_eq!(files.len(), 1);
+        // the feature is not enabled yet, so the partition column is still stripped
+        let columns = data_file_columns(&table, &files[0]).await;
+        assert_eq!(columns, [&arr_phys, &m_phys, &s_phys].map(String::as_str));
+        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
+            table.log_store().object_store(),
+            files[0].clone(),
+        );
+        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap();
+        let mut ids = HashMap::new();
+        for field in builder.parquet_schema().root_schema().get_fields() {
+            parquet_field_ids(field, "", &mut ids);
+        }
+        let id = |path: String| {
+            ids.get(&path)
+                .copied()
+                .map(i64::from)
+                .unwrap_or_else(|| panic!("no field id at {path}: {ids:?}"))
+        };
+        assert_eq!(id(arr_phys.clone()), arr.column_mapping_id().unwrap());
+        assert_eq!(
+            id(format!("{arr_phys}.list.element")),
+            arr_ids[&format!("{arr_phys}.element")]
+        );
+        assert_eq!(
+            id(format!("{m_phys}.key_value.key")),
+            m_ids[&format!("{m_phys}.key")]
+        );
+        assert_eq!(
+            id(format!("{m_phys}.key_value.value")),
+            m_ids[&format!("{m_phys}.value")]
+        );
+        assert_eq!(
+            id(format!("{m_phys}.key_value.value.list.element")),
+            m_ids[&format!("{m_phys}.value.element")]
+        );
+        assert_eq!(
+            id(format!("{s_phys}.{inner_phys}")),
+            inner.column_mapping_id().unwrap()
+        );
+        assert_eq!(
+            id(format!("{s_phys}.{inner_phys}.list.element")),
+            inner_ids[&format!("{inner_phys}.element")]
+        );
+
+        let data = get_data(&table).await;
+        assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
     /// `delta.writePartitionColumnsToParquet` materializes without a writer feature.
     #[tokio::test]
     async fn test_write_partition_columns_to_parquet_property() {
