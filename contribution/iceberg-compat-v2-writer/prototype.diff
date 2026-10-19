@@ -1,0 +1,1025 @@
+diff --git a/crates/core/src/datafile/properties.rs b/crates/core/src/datafile/properties.rs
+index 29b81ff7..acafe20e 100644
+--- a/crates/core/src/datafile/properties.rs
++++ b/crates/core/src/datafile/properties.rs
+@@ -12,6 +12,7 @@ use std::num::NonZeroU64;
+ use std::sync::LazyLock;
+ 
+ use delta_kernel::table_configuration::TableConfiguration;
++use delta_kernel::table_features::TableFeature;
+ use delta_kernel::table_properties::DataSkippingNumIndexedCols;
+ use parquet::basic::Compression;
+ use parquet::file::properties::WriterProperties;
+@@ -20,7 +21,7 @@ use crate::datafile::writer::ArrowWriterOptions;
+ use crate::errors::DeltaResult;
+ use crate::kernel::arrow::engine_ext::stats_table_properties;
+ use crate::parquet_utils::default_writer_properties;
+-use crate::table::config::{DEFAULT_NUM_INDEX_COLS, TablePropertiesExt as _};
++use crate::table::config::{DEFAULT_NUM_INDEX_COLS, TablePropertiesExt as _, TableProperty};
+ 
+ /// Rows per slice handed to the parquet writer when none is set.
+ pub(crate) const DEFAULT_WRITE_BATCH_SIZE: usize = 8192;
+@@ -143,6 +144,20 @@ impl WriterStatsConfig {
+     }
+ }
+ 
++/// Whether data files must carry the partition columns (PROTOCOL.md, "Materialize Partition
++/// Columns"): a writer feature that requires it takes priority, otherwise the
++/// `delta.writePartitionColumnsToParquet` table property decides.
++pub(crate) fn materialize_partition_columns(config: &TableConfiguration) -> bool {
++    config.is_feature_supported(&TableFeature::MaterializePartitionColumns)
++        || config.is_feature_enabled(&TableFeature::IcebergCompatV1)
++        || config.is_feature_enabled(&TableFeature::IcebergCompatV2)
++        || config
++            .table_properties()
++            .unknown_properties
++            .get(TableProperty::WritePartitionColumnsToParquet.as_ref())
++            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
++}
++
+ /// Everything that shapes a Delta data file.
+ ///
+ /// Unset fields fall back to delta-rs defaults, or to the table's where an
+diff --git a/crates/core/src/datafile/writer/dataset.rs b/crates/core/src/datafile/writer/dataset.rs
+index 85c2e044..c8bbad8f 100644
+--- a/crates/core/src/datafile/writer/dataset.rs
++++ b/crates/core/src/datafile/writer/dataset.rs
+@@ -38,6 +38,9 @@ pub struct WriterConfig {
+     /// [`UploadBudget`] for closed files still uploading. Every writer built from this
+     /// config, or from a clone of it, shares it.
+     upload_budget: UploadBudget,
++    /// Keep the partition columns in the data files (`materializePartitionColumns`,
++    /// `icebergCompatV1/V2`, `delta.writePartitionColumnsToParquet`) instead of stripping them.
++    materialize_partition_columns: bool,
+ }
+ 
+ impl WriterConfig {
+@@ -54,9 +57,17 @@ impl WriterConfig {
+             path_prefix: None,
+             upload_budget: UploadBudget::for_write(writer_properties.target_file_size()),
+             writer_properties,
++            materialize_partition_columns: false,
+         }
+     }
+ 
++    /// Also write the partition columns into every data file, with the value the file's
++    /// `partitionValues` carry. Stats are still not collected for them.
++    pub fn with_materialize_partition_columns(mut self, materialize: bool) -> Self {
++        self.materialize_partition_columns = materialize;
++        self
++    }
++
+     /// Write every data file below `prefix` under the table root, so the returned
+     /// [`Add`] paths stay table-relative.
+     pub fn with_path_prefix(mut self, prefix: Option<Path>) -> Self {
+@@ -80,6 +91,9 @@ impl WriterConfig {
+ 
+     /// Schema of files written to disk
+     pub fn file_schema(&self) -> ArrowSchemaRef {
++        if self.materialize_partition_columns {
++            return self.table_schema.clone();
++        }
+         arrow_schema_without_partitions(&self.table_schema, &self.partition_columns)
+     }
+ }
+@@ -195,8 +209,11 @@ impl DeltaWriter {
+         partition_values: &IndexMap<String, Scalar>,
+     ) -> DeltaResult<()> {
+         let key = Path::parse(partition_values.hive_partition_path())?;
+-        let record_batch =
+-            record_batch_without_partitions(&record_batch, &self.config.partition_columns)?;
++        let record_batch = if self.config.materialize_partition_columns {
++            record_batch
++        } else {
++            record_batch_without_partitions(&record_batch, &self.config.partition_columns)?
++        };
+         self.write_keyed(key, &record_batch, || partition_values.clone())
+             .await
+     }
+diff --git a/crates/core/src/delta_datafusion/column_mapping.rs b/crates/core/src/delta_datafusion/column_mapping.rs
+index d1e82791..e866e816 100644
+--- a/crates/core/src/delta_datafusion/column_mapping.rs
++++ b/crates/core/src/delta_datafusion/column_mapping.rs
+@@ -28,7 +28,8 @@ use datafusion::physical_plan::{
+     PlanProperties, ReplaceChildrenOptions,
+ };
+ use delta_kernel::schema::{
+-    DataType as KernelDataType, SchemaRef as KernelSchemaRef, StructField, StructType,
++    ColumnMetadataKey, DataType as KernelDataType, MetadataValue, SchemaRef as KernelSchemaRef,
++    StructField, StructType,
+ };
+ use delta_kernel::table_configuration::TableConfiguration;
+ use delta_kernel::table_features::ColumnMappingMode;
+@@ -336,6 +337,52 @@ fn metadata_without_field_id(field: &Field) -> HashMap<String, String> {
+         .collect()
+ }
+ 
++/// Parquet field ids of the synthetic `element` / `key` / `value` slots below one table field,
++/// from its `delta.columnMapping.nested.ids` metadata (assigned on IcebergCompatV2 tables). Keys
++/// are dot-paths rooted at the field's physical name, e.g. `col-aaa.value.element`.
++struct NestedFieldIds {
++    ids: HashMap<String, i64>,
++    /// Dot-path of the field being rebuilt.
++    path: String,
++}
++
++impl NestedFieldIds {
++    fn of(kernel_field: &StructField, mode: ColumnMappingMode) -> Self {
++        let ids = match kernel_field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds) {
++            Some(MetadataValue::Other(serde_json::Value::Object(map))) => map
++                .iter()
++                .filter_map(|(key, id)| Some((key.clone(), id.as_i64()?)))
++                .collect(),
++            _ => HashMap::new(),
++        };
++        Self {
++            ids,
++            path: kernel_field.physical_name(mode).to_string(),
++        }
++    }
++
++    /// The ids seen from the `slot` (`element`, `key` or `value`) below the current path.
++    fn child(&self, slot: &str) -> NestedFieldIds {
++        NestedFieldIds {
++            ids: self.ids.clone(),
++            path: format!("{}.{slot}", self.path),
++        }
++    }
++
++    /// The field id of the current path, if the table assigned one.
++    fn id(&self) -> Option<i64> {
++        self.ids.get(&self.path).copied()
++    }
++
++    /// `metadata` with the current path's field id attached, when there is one.
++    fn attach(&self, mut metadata: HashMap<String, String>) -> HashMap<String, String> {
++        if let Some(id) = self.id() {
++            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
++        }
++        metadata
++    }
++}
++
+ /// Build the physical Arrow field for a single logical field: rename to the physical name,
+ /// attach the table-owned `field_id` metadata, and recurse into nested types — all while
+ /// preserving the input Arrow data type.
+@@ -345,7 +392,8 @@ fn physical_field(field: &Field, kernel_field: &StructField, mode: ColumnMapping
+     if let Some(id) = kernel_field.column_mapping_id() {
+         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+     }
+-    let data_type = physical_data_type(field.data_type(), kernel_field.data_type(), mode);
++    let nested = NestedFieldIds::of(kernel_field, mode);
++    let data_type = physical_data_type(field.data_type(), kernel_field.data_type(), mode, &nested);
+     Field::new(
+         kernel_field.physical_name(mode),
+         data_type,
+@@ -362,6 +410,7 @@ fn physical_data_type(
+     arrow_type: &DataType,
+     kernel_type: &KernelDataType,
+     mode: ColumnMappingMode,
++    nested: &NestedFieldIds,
+ ) -> DataType {
+     match kernel_type {
+         KernelDataType::Struct(kernel_struct) => {
+@@ -372,22 +421,24 @@ fn physical_data_type(
+         }
+         KernelDataType::Array(kernel_array) => {
+             let element_kernel = kernel_array.element_type();
++            let nested = nested.child("element");
+             match arrow_type {
+                 DataType::List(element) => {
+-                    DataType::List(rebuild_element(element, element_kernel, mode))
++                    DataType::List(rebuild_element(element, element_kernel, mode, &nested))
+                 }
+                 DataType::LargeList(element) => {
+-                    DataType::LargeList(rebuild_element(element, element_kernel, mode))
++                    DataType::LargeList(rebuild_element(element, element_kernel, mode, &nested))
+                 }
+                 DataType::ListView(element) => {
+-                    DataType::ListView(rebuild_element(element, element_kernel, mode))
++                    DataType::ListView(rebuild_element(element, element_kernel, mode, &nested))
+                 }
+                 DataType::LargeListView(element) => {
+-                    DataType::LargeListView(rebuild_element(element, element_kernel, mode))
+-                }
+-                DataType::FixedSizeList(element, len) => {
+-                    DataType::FixedSizeList(rebuild_element(element, element_kernel, mode), *len)
++                    DataType::LargeListView(rebuild_element(element, element_kernel, mode, &nested))
+                 }
++                DataType::FixedSizeList(element, len) => DataType::FixedSizeList(
++                    rebuild_element(element, element_kernel, mode, &nested),
++                    *len,
++                ),
+                 _ => arrow_type.clone(),
+             }
+         }
+@@ -408,18 +459,28 @@ fn physical_data_type(
+                 })
+                 .collect();
+             if let Some(key) = new_fields.get_mut(0) {
+-                *key = key.clone().with_data_type(physical_data_type(
+-                    key.data_type(),
+-                    kernel_map.key_type(),
+-                    mode,
+-                ));
++                let nested = nested.child("key");
++                *key = key
++                    .clone()
++                    .with_data_type(physical_data_type(
++                        key.data_type(),
++                        kernel_map.key_type(),
++                        mode,
++                        &nested,
++                    ))
++                    .with_metadata(nested.attach(key.metadata().clone()));
+             }
+             if let Some(value) = new_fields.get_mut(1) {
+-                *value = value.clone().with_data_type(physical_data_type(
+-                    value.data_type(),
+-                    kernel_map.value_type(),
+-                    mode,
+-                ));
++                let nested = nested.child("value");
++                *value = value
++                    .clone()
++                    .with_data_type(physical_data_type(
++                        value.data_type(),
++                        kernel_map.value_type(),
++                        mode,
++                        &nested,
++                    ))
++                    .with_metadata(nested.attach(value.metadata().clone()));
+             }
+             let new_entries = Field::new(
+                 entries.name(),
+@@ -439,11 +500,12 @@ fn rebuild_element(
+     element: &Arc<Field>,
+     element_kernel: &KernelDataType,
+     mode: ColumnMappingMode,
++    nested: &NestedFieldIds,
+ ) -> Arc<Field> {
+-    let data_type = physical_data_type(element.data_type(), element_kernel, mode);
++    let data_type = physical_data_type(element.data_type(), element_kernel, mode, nested);
+     Arc::new(
+         Field::new(element.name(), data_type, element.is_nullable())
+-            .with_metadata(metadata_without_field_id(element)),
++            .with_metadata(nested.attach(metadata_without_field_id(element))),
+     )
+ }
+ 
+diff --git a/crates/core/src/kernel/models/actions.rs b/crates/core/src/kernel/models/actions.rs
+index 1304b615..6b7076d9 100644
+--- a/crates/core/src/kernel/models/actions.rs
++++ b/crates/core/src/kernel/models/actions.rs
+@@ -384,6 +384,9 @@ impl ProtocolInner {
+                     "delta.enableRowTracking" if parse_bool(value) => {
+                         Some(TableFeature::RowTracking)
+                     }
++                    "delta.enableIcebergCompatV2" if parse_bool(value) => {
++                        Some(TableFeature::IcebergCompatV2)
++                    }
+                     "delta.checkpointPolicy" if value == "v2" => Some(TableFeature::V2Checkpoint),
+                     _ => None,
+                 })
+@@ -529,6 +532,54 @@ impl ProtocolInner {
+             }
+         }
+ 
++        // IcebergCompatV2 (PROTOCOL.md "Iceberg Compatibility V2"): a writer-only feature that
++        // requires column mapping and excludes IcebergCompatV1 and active deletion vectors.
++        // The writer requirements themselves (partition columns in the data files, nested
++        // field ids, numRecords stats) are met by the DataFusion write paths.
++        let property_is_true = |property: &TableProperty| -> DeltaResult<bool> {
++            match parsed_properties.get(property) {
++                None => Ok(false),
++                Some(value) => value.to_ascii_lowercase().parse::<bool>().map_err(|_| {
++                    Error::Generic(format!(
++                        "{} = '{value}' is invalid, valid values are ['true', 'false']",
++                        property.as_ref()
++                    ))
++                }),
++            }
++        };
++        if property_is_true(&TableProperty::EnableIcebergCompatV2)? {
++            let column_mapping_in_properties = parsed_properties
++                .get(&TableProperty::ColumnMappingMode)
++                .is_some_and(|mode| mode != "none");
++            let column_mapping_in_protocol = self.min_reader_version == 2
++                || self
++                    .reader_features
++                    .as_ref()
++                    .is_some_and(|features| features.contains(&TableFeature::ColumnMapping));
++            if !column_mapping_in_properties && !column_mapping_in_protocol {
++                return Err(Error::Generic(
++                    "delta.enableIcebergCompatV2 requires delta.columnMapping.mode = 'name' or 'id'"
++                        .to_string(),
++                ));
++            }
++            if property_is_true(&TableProperty::EnableIcebergCompatV1)? {
++                return Err(Error::Generic(
++                    "delta.enableIcebergCompatV2 cannot be combined with delta.enableIcebergCompatV1"
++                        .to_string(),
++                ));
++            }
++            if property_is_true(&TableProperty::EnableDeletionVectors)? {
++                return Err(Error::Generic(
++                    "delta.enableIcebergCompatV2 cannot be combined with delta.enableDeletionVectors"
++                        .to_string(),
++                ));
++            }
++            self.min_writer_version = 7;
++            self.writer_features
++                .get_or_insert_with(HashSet::new)
++                .insert(TableFeature::IcebergCompatV2);
++        }
++
+         // Check columnMappingMode and bump protocol or add reader/writerFeatures
+         if let Some(mode) = parsed_properties.get(&TableProperty::ColumnMappingMode)
+             && mode.as_str() != "none"
+@@ -723,6 +774,8 @@ pub enum TableFeatures {
+     DomainMetadata,
+     /// Iceberg compatibility support
+     IcebergCompatV1,
++    /// Iceberg compatibility V2 support (UniForm)
++    IcebergCompatV2,
+     /// Variant type support
+     VariantType,
+     /// Preview variant type support
+@@ -753,6 +806,7 @@ impl FromStr for TableFeatures {
+             "rowTracking" => Ok(TableFeatures::RowTracking),
+             "domainMetadata" => Ok(TableFeatures::DomainMetadata),
+             "icebergCompatV1" => Ok(TableFeatures::IcebergCompatV1),
++            "icebergCompatV2" => Ok(TableFeatures::IcebergCompatV2),
+             "variantType" => Ok(TableFeatures::VariantType),
+             "variantType-preview" => Ok(TableFeatures::VariantTypePreview),
+             "variantShredding-preview" => Ok(TableFeatures::VariantShreddingPreview),
+@@ -780,6 +834,7 @@ impl AsRef<str> for TableFeatures {
+             TableFeatures::RowTracking => "rowTracking",
+             TableFeatures::DomainMetadata => "domainMetadata",
+             TableFeatures::IcebergCompatV1 => "icebergCompatV1",
++            TableFeatures::IcebergCompatV2 => "icebergCompatV2",
+             TableFeatures::VariantType => "variantType",
+             TableFeatures::VariantTypePreview => "variantType-preview",
+             TableFeatures::VariantShreddingPreview => "variantShredding-preview",
+diff --git a/crates/core/src/kernel/transaction/protocol.rs b/crates/core/src/kernel/transaction/protocol.rs
+index f2a92484..55d65ac6 100644
+--- a/crates/core/src/kernel/transaction/protocol.rs
++++ b/crates/core/src/kernel/transaction/protocol.rs
+@@ -336,6 +336,13 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
+         writer_features.insert(TableFeature::CheckConstraints);
+         writer_features.insert(TableFeature::GeneratedColumns);
+         writer_features.insert(TableFeature::ColumnMapping);
++        // The DataFusion write paths (write, merge, update, delete, optimize) keep the
++        // partition columns in the data files when the table requires it.
++        writer_features.insert(TableFeature::MaterializePartitionColumns);
++        // IcebergCompatV2: column mapping + nested field ids + materialized partition
++        // columns + numRecords stats, all produced by the DataFusion write paths; the
++        // schema restrictions are checked when the table is created.
++        writer_features.insert(TableFeature::IcebergCompatV2);
+     }
+     writer_features.insert(TableFeature::DeletionVectors);
+     // writer_features.insert(TableFeature::IdentityColumns);
+diff --git a/crates/core/src/operations/create.rs b/crates/core/src/operations/create.rs
+index a813b0ad..6d85f3d6 100644
+--- a/crates/core/src/operations/create.rs
++++ b/crates/core/src/operations/create.rs
+@@ -61,6 +61,44 @@ fn data_type_has_column_mapping_metadata(data_type: &DataType) -> bool {
+     }
+ }
+ 
++/// IcebergCompatV2 allows only `byte`, `short`, `integer`, `long`, `float`, `double`, `decimal`,
++/// `string`, `binary`, `boolean`, `timestamp`, `timestampNTZ`, `date`, `array`, `map` and
++/// `struct` (PROTOCOL.md "Writer Requirements for IcebergCompatV2"). Column mapping already
++/// blocks later schema changes on the table, so the schema is only checked here.
++fn ensure_iceberg_compat_v2_types(schema: &StructType) -> DeltaResult<()> {
++    fn check(data_type: &DataType, path: &str) -> DeltaResult<()> {
++        use delta_kernel::schema::PrimitiveType;
++        match data_type {
++            DataType::Primitive(primitive) => match primitive {
++                PrimitiveType::Void => Err(unsupported(path, data_type)),
++                #[cfg(feature = "nanosecond-timestamps")]
++                PrimitiveType::TimestampNanos | PrimitiveType::TimestampNanosNtz => {
++                    Err(unsupported(path, data_type))
++                }
++                _ => Ok(()),
++            },
++            DataType::Variant(_) => Err(unsupported(path, data_type)),
++            DataType::Array(array) => check(array.element_type(), &format!("{path}.element")),
++            DataType::Map(map) => {
++                check(map.key_type(), &format!("{path}.key"))?;
++                check(map.value_type(), &format!("{path}.value"))
++            }
++            DataType::Struct(fields) => fields.fields().try_for_each(|field| {
++                check(field.data_type(), &format!("{path}.{}", field.name()))
++            }),
++        }
++    }
++    fn unsupported(path: &str, data_type: &DataType) -> DeltaTableError {
++        DeltaTableError::Generic(format!(
++            "delta.enableIcebergCompatV2 does not allow the type {data_type} of column '{}'",
++            path.trim_start_matches('.')
++        ))
++    }
++    schema
++        .fields()
++        .try_for_each(|field| check(field.data_type(), field.name()))
++}
++
+ fn field_has_column_mapping_metadata(field: &StructField) -> bool {
+     field
+         .metadata()
+@@ -329,7 +367,15 @@ impl CreateBuilder {
+             // The guard above (field_has_column_mapping_metadata) rejects schemas that carry any
+             // pre-existing CM annotations, so there are no existing ids to scan — start from 0.
+             let mut max_id: i64 = 0;
+-            let mapped = assign_column_mapping_metadata(&schema, &mut max_id, false)?;
++            // IcebergCompatV2 also needs parquet field ids for array elements and map keys/values
++            // (`delta.columnMapping.nested.ids`, PROTOCOL.md "Writer Requirements for IcebergCompatV2").
++            let nested_ids = configuration
++                .get(TableProperty::EnableIcebergCompatV2.as_ref())
++                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
++            if nested_ids {
++                ensure_iceberg_compat_v2_types(&schema)?;
++            }
++            let mapped = assign_column_mapping_metadata(&schema, &mut max_id, nested_ids)?;
+             configuration.insert(
+                 "delta.columnMapping.maxColumnId".to_string(),
+                 max_id.to_string(),
+diff --git a/crates/core/src/operations/optimize.rs b/crates/core/src/operations/optimize.rs
+index 653e1b2b..b85adcdd 100644
+--- a/crates/core/src/operations/optimize.rs
++++ b/crates/core/src/operations/optimize.rs
+@@ -44,7 +44,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
+ use tracing::*;
+ 
+ use crate::datafile::DeltaWriterProperties;
+-use crate::datafile::properties::OPTIMIZE_PARQUET_PROPERTIES;
++use crate::datafile::properties::{OPTIMIZE_PARQUET_PROPERTIES, materialize_partition_columns};
+ use crate::datafile::writer::{
+     ArrowWriterOptions, PartitionWriter, PartitionWriterConfig, UploadBudget,
+ };
+@@ -1044,10 +1044,12 @@ pub async fn create_merge_plan(
+     };
+     // Write the types the rewrite scan produces (e.g. view types), so batches need no cast
+     let scan_config = DeltaScanConfig::new_from_session(&session);
+-    let file_schema = arrow_schema_without_partitions(
+-        &scan_config.table_schema(snapshot.table_configuration())?,
+-        partitions_keys,
+-    );
++    let table_schema = scan_config.table_schema(snapshot.table_configuration())?;
++    let file_schema = if materialize_partition_columns(snapshot.table_configuration()) {
++        table_schema
++    } else {
++        arrow_schema_without_partitions(&table_schema, partitions_keys)
++    };
+ 
+     Ok(MergePlan {
+         operations,
+diff --git a/crates/core/src/operations/set_tbl_properties.rs b/crates/core/src/operations/set_tbl_properties.rs
+index d2ff37f0..0ce803cc 100644
+--- a/crates/core/src/operations/set_tbl_properties.rs
++++ b/crates/core/src/operations/set_tbl_properties.rs
+@@ -73,6 +73,15 @@ fn plan_set_table_properties_actions(
+             "SET TBLPROPERTIES delta.columnMapping.mode",
+         ));
+     }
++    // The nested field ids IcebergCompatV2 needs are assigned to the schema at CREATE TABLE.
++    if properties
++        .get(TableProperty::EnableIcebergCompatV2.as_ref())
++        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
++    {
++        return Err(DeltaTableError::Generic(
++            "delta.enableIcebergCompatV2 can only be set when the table is created".to_string(),
++        ));
++    }
+ 
+     let mut metadata = snapshot.metadata.clone();
+     let current_protocol = snapshot.protocol;
+diff --git a/crates/core/src/operations/write/execution.rs b/crates/core/src/operations/write/execution.rs
+index 3854d869..df880693 100644
+--- a/crates/core/src/operations/write/execution.rs
++++ b/crates/core/src/operations/write/execution.rs
+@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
+ 
+ use crate::DeltaTableError;
+ use crate::datafile::DeltaWriterProperties;
++use crate::datafile::properties::materialize_partition_columns;
+ use crate::datafile::writer::{DeltaWriter, UploadBudget, WriterConfig, write_batches_timed};
+ use crate::delta_datafusion::{ColumnMappingState, DataValidationExec, validation_predicates};
+ use crate::errors::DeltaResult;
+@@ -283,6 +284,8 @@ struct WriteSinkConfig {
+     column_mapping: Option<ColumnMappingState>,
+     /// Directory under the table root the data files go below.
+     path_prefix: Option<Path>,
++    /// Keep the partition columns in the data files (see [`materialize_partition_columns`]).
++    materialize_partition_columns: bool,
+ }
+ 
+ impl WriteSinkConfig {
+@@ -297,6 +300,7 @@ impl WriteSinkConfig {
+             props: props.apply_table_stats(table_config),
+             column_mapping: ColumnMappingState::from_table_config(table_config),
+             path_prefix: None,
++            materialize_partition_columns: materialize_partition_columns(table_config),
+         }
+     }
+ 
+@@ -754,12 +758,14 @@ async fn write_data_plan(
+         props,
+         column_mapping,
+         path_prefix,
++        materialize_partition_columns,
+     } = sink_config;
+     let (plan, partition_columns, random_prefix_length) =
+         apply_column_mapping_to_plan(plan, partition_columns, &column_mapping)?;
+     let config = WriterConfig::new(plan.schema().clone(), partition_columns.clone(), props)
+         .with_random_prefix_length(random_prefix_length)
+-        .with_path_prefix(path_prefix);
++        .with_path_prefix(path_prefix)
++        .with_materialize_partition_columns(materialize_partition_columns);
+ 
+     // For unpartitioned writes, centralize writer behavior through write_streams.
+     if partition_columns.is_empty() {
+@@ -909,6 +915,7 @@ async fn write_cdc_plan(
+         props,
+         column_mapping,
+         path_prefix,
++        materialize_partition_columns,
+     } = sink_config;
+     if path_prefix.is_some() {
+         return Err(DeltaTableError::generic(
+@@ -944,12 +951,14 @@ async fn write_cdc_plan(
+         props.clone(),
+     )
+     .with_random_prefix_length(random_prefix_length)
+-    .with_upload_budget(upload_budget.clone());
++    .with_upload_budget(upload_budget.clone())
++    .with_materialize_partition_columns(materialize_partition_columns);
+ 
+     let cdf_config = WriterConfig::new(cdf_schema.clone(), partition_columns.clone(), props)
+         .with_random_prefix_length(random_prefix_length)
+         .with_path_prefix(Some(Path::from(CHANGE_DATA_DIR)))
+-        .with_upload_budget(upload_budget);
++        .with_upload_budget(upload_budget)
++        .with_materialize_partition_columns(materialize_partition_columns);
+ 
+     // Keep the previous single-writer fan-in path for unpartitioned tables.
+     if partition_columns.is_empty() {
+diff --git a/crates/core/src/operations/write/mod.rs b/crates/core/src/operations/write/mod.rs
+index 070b105c..344f6559 100644
+--- a/crates/core/src/operations/write/mod.rs
++++ b/crates/core/src/operations/write/mod.rs
+@@ -670,6 +670,7 @@ mod tests {
+     use crate::TableProperty;
+     use crate::ensure_table_uri;
+     use crate::kernel::CommitInfo;
++    use crate::kernel::ProtocolExt as _;
+     use crate::logstore::get_actions;
+     use crate::operations::collect_sendable_stream;
+     use crate::protocol::SaveMode;
+@@ -688,6 +689,7 @@ mod tests {
+     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
+     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+     use delta_kernel::schema::MetadataValue;
++    use delta_kernel::table_features::TableFeature;
+     use futures::TryStreamExt;
+     use itertools::Itertools;
+     use serde_json::{Value, json};
+@@ -863,6 +865,369 @@ mod tests {
+         assert_eq!(parquet_columns, physical_names);
+     }
+ 
++    /// Column names of the parquet file at `path`, in file order.
++    async fn data_file_columns(table: &DeltaTable, path: &object_store::path::Path) -> Vec<String> {
++        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
++            table.log_store().object_store(),
++            path.clone(),
++        );
++        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
++            .await
++            .unwrap();
++        builder
++            .schema()
++            .fields()
++            .iter()
++            .map(|field| field.name().clone())
++            .collect()
++    }
++
++    /// With `materializePartitionColumns` supported, write and optimize keep the partition
++    /// columns in the data files, collect no stats for them, and reads still see each column once.
++    #[tokio::test]
++    async fn test_materialize_partition_columns_keeps_partition_columns_in_data_files() {
++        let table = DeltaTable::new_in_memory()
++            .write(vec![get_record_batch(None, false)])
++            .with_partition_columns(["modified"])
++            .await
++            .unwrap();
++        for file in table.snapshot().unwrap().log_data().iter() {
++            let columns = data_file_columns(&table, &file.object_store_path()).await;
++            assert_eq!(columns, ["id", "value"]);
++        }
++
++        let table = table
++            .add_feature()
++            .with_feature(crate::kernel::TableFeatures::MaterializePartitionColumns)
++            .with_allow_protocol_versions_increase(true)
++            .await
++            .unwrap();
++        let table = table
++            .write(vec![get_record_batch(None, false)])
++            .with_save_mode(SaveMode::Append)
++            .await
++            .unwrap();
++        // compaction rewrites the pre-feature files too, so every file ends up materialized
++        let (table, metrics) = table.optimize().await.unwrap();
++        assert_eq!(metrics.num_files_removed, 4);
++        assert_eq!(metrics.num_files_added, 2);
++
++        let files: Vec<_> = table.snapshot().unwrap().log_data().iter().collect();
++        assert_eq!(files.len(), 2);
++        for file in &files {
++            let columns = data_file_columns(&table, &file.object_store_path()).await;
++            assert_eq!(columns, ["id", "value", "modified"]);
++            let stats: Value = serde_json::from_str(&file.stats().unwrap()).unwrap();
++            assert!(stats["numRecords"].as_i64().unwrap() > 0);
++            assert!(stats["minValues"].get("id").is_some());
++            assert!(stats["minValues"].get("modified").is_none(), "{stats}");
++            assert!(stats["nullCount"].get("modified").is_none(), "{stats}");
++        }
++
++        let data = get_data(&table).await;
++        assert_eq!(data[0].schema().fields().len(), 3);
++        assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 22);
++    }
++
++    /// Parquet `field_id`s below `node`, keyed by dot-path including the list/map wrapper groups
++    /// (e.g. `col-a.list.element`).
++    fn parquet_field_ids(
++        node: &parquet::schema::types::Type,
++        path: &str,
++        out: &mut HashMap<String, i32>,
++    ) {
++        let info = node.get_basic_info();
++        let path = if path.is_empty() {
++            info.name().to_string()
++        } else {
++            format!("{path}.{}", info.name())
++        };
++        if info.has_id() {
++            out.insert(path.clone(), info.id());
++        }
++        if let parquet::schema::types::Type::GroupType { fields, .. } = node {
++            for field in fields {
++                parquet_field_ids(field, &path, out);
++            }
++        }
++    }
++
++    /// An IcebergCompatV2 table assigns `delta.columnMapping.nested.ids` to array elements and
++    /// map keys/values, and the writer stores them in the parquet `field_id` of those nodes.
++    #[tokio::test]
++    async fn test_iceberg_compat_v2_writes_nested_field_ids() {
++        use arrow::array::{ListArray, StructArray, new_null_array};
++        use arrow::buffer::OffsetBuffer;
++        use delta_kernel::schema::{
++            ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, StructField,
++        };
++
++        let int_array =
++            || KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true)));
++        let columns = vec![
++            StructField::new("arr", int_array(), true),
++            StructField::new(
++                "m",
++                KernelDataType::Map(Box::new(MapType::new(
++                    KernelDataType::STRING,
++                    int_array(),
++                    true,
++                ))),
++                true,
++            ),
++            StructField::new(
++                "s",
++                KernelDataType::Struct(Box::new(
++                    StructType::try_new([StructField::new("inner", int_array(), true)]).unwrap(),
++                )),
++                true,
++            ),
++            StructField::new("p", KernelDataType::STRING, true),
++        ];
++        let table = DeltaTable::new_in_memory()
++            .create()
++            .with_columns(columns)
++            .with_partition_columns(["p"])
++            .with_configuration_property(TableProperty::ColumnMappingMode, Some("name"))
++            .with_configuration_property(TableProperty::EnableIcebergCompatV2, Some("true"))
++            .await
++            .unwrap();
++
++        let snapshot = table.snapshot().unwrap().snapshot();
++        // the property turned on the writer feature, which delta-rs supports
++        let protocol = snapshot.protocol();
++        assert_eq!(protocol.min_writer_version(), 7);
++        let writer_features = protocol.writer_features_set().unwrap();
++        assert!(writer_features.contains(&TableFeature::IcebergCompatV2));
++        assert!(writer_features.contains(&TableFeature::ColumnMapping));
++        assert!(
++            snapshot
++                .table_configuration()
++                .is_feature_enabled(&TableFeature::IcebergCompatV2)
++        );
++        crate::kernel::transaction::PROTOCOL
++            .can_write_to(snapshot)
++            .unwrap();
++        let schema = snapshot.schema();
++        let nested_ids = |field: &StructField| -> HashMap<String, i64> {
++            match field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds) {
++                Some(MetadataValue::Other(Value::Object(ids))) => ids
++                    .iter()
++                    .map(|(key, id)| (key.clone(), id.as_i64().unwrap()))
++                    .collect(),
++                other => panic!("{}: expected nested ids, got {other:?}", field.name()),
++            }
++        };
++        let physical =
++            |field: &StructField| field.physical_name(ColumnMappingMode::Name).to_string();
++
++        let arr = schema.field("arr").unwrap();
++        let (arr_phys, arr_ids) = (physical(arr), nested_ids(arr));
++        assert_eq!(
++            arr_ids.keys().collect_vec(),
++            [&format!("{arr_phys}.element")]
++        );
++
++        let m = schema.field("m").unwrap();
++        let (m_phys, m_ids) = (physical(m), nested_ids(m));
++        assert_eq!(
++            m_ids.keys().sorted().collect_vec(),
++            [
++                &format!("{m_phys}.key"),
++                &format!("{m_phys}.value"),
++                &format!("{m_phys}.value.element")
++            ]
++        );
++
++        let s = schema.field("s").unwrap();
++        let s_phys = physical(s);
++        let KernelDataType::Struct(s_type) = s.data_type() else {
++            panic!("s is a struct")
++        };
++        let inner = s_type.field("inner").unwrap();
++        let (inner_phys, inner_ids) = (physical(inner), nested_ids(inner));
++        assert_eq!(
++            inner_ids.keys().collect_vec(),
++            [&format!("{inner_phys}.element")]
++        );
++
++        let p = schema.field("p").unwrap();
++        let p_phys = physical(p);
++
++        // 5 column-mapping ids (arr, m, s, inner, p) + 5 nested ids, all distinct
++        let all_ids: Vec<i64> = [arr, m, s, inner, p]
++            .iter()
++            .map(|f| f.column_mapping_id().unwrap())
++            .chain(arr_ids.values().copied())
++            .chain(m_ids.values().copied())
++            .chain(inner_ids.values().copied())
++            .collect();
++        assert_eq!(all_ids.iter().unique().count(), 10);
++        assert_eq!(
++            snapshot.metadata().configuration()["delta.columnMapping.maxColumnId"],
++            "10"
++        );
++
++        // write one file: arr and s carry data, m is all null, p is the partition value
++        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
++        let DataType::List(arr_elem) = arrow_schema.field(0).data_type() else {
++            panic!("arr is a list")
++        };
++        let DataType::Struct(s_fields) = arrow_schema.field(2).data_type() else {
++            panic!("s is a struct")
++        };
++        let DataType::List(inner_elem) = s_fields[0].data_type() else {
++            panic!("inner is a list")
++        };
++        let batch = RecordBatch::try_new(
++            Arc::new(arrow_schema.clone()),
++            vec![
++                Arc::new(ListArray::new(
++                    arr_elem.clone(),
++                    OffsetBuffer::from_lengths([2, 1]),
++                    Arc::new(Int32Array::from(vec![1, 2, 3])),
++                    None,
++                )),
++                new_null_array(arrow_schema.field(1).data_type(), 2),
++                Arc::new(StructArray::new(
++                    s_fields.clone(),
++                    vec![Arc::new(ListArray::new(
++                        inner_elem.clone(),
++                        OffsetBuffer::from_lengths([1, 2]),
++                        Arc::new(Int32Array::from(vec![4, 5, 6])),
++                        None,
++                    ))],
++                    None,
++                )),
++                Arc::new(StringArray::from(vec!["x", "x"])),
++            ],
++        )
++        .unwrap();
++        let table = table.write(vec![batch]).await.unwrap();
++
++        let files = table.get_files_by_partitions(&[]).await.unwrap();
++        assert_eq!(files.len(), 1);
++        // the partition column is materialized under its physical name, without stats
++        let columns = data_file_columns(&table, &files[0]).await;
++        assert_eq!(
++            columns,
++            [&arr_phys, &m_phys, &s_phys, &p_phys].map(String::as_str)
++        );
++        let file = table.snapshot().unwrap().log_data().iter().next().unwrap();
++        let stats: Value = serde_json::from_str(&file.stats().unwrap()).unwrap();
++        assert_eq!(stats["numRecords"], 2);
++        assert!(stats["nullCount"].get(&p_phys).is_none(), "{stats}");
++        let reader = crate::logstore::parquet_reader::ParquetObjectReader::new(
++            table.log_store().object_store(),
++            files[0].clone(),
++        );
++        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
++            .await
++            .unwrap();
++        let mut ids = HashMap::new();
++        for field in builder.parquet_schema().root_schema().get_fields() {
++            parquet_field_ids(field, "", &mut ids);
++        }
++        let id = |path: String| {
++            ids.get(&path)
++                .copied()
++                .map(i64::from)
++                .unwrap_or_else(|| panic!("no field id at {path}: {ids:?}"))
++        };
++        assert_eq!(id(arr_phys.clone()), arr.column_mapping_id().unwrap());
++        assert_eq!(
++            id(format!("{arr_phys}.list.element")),
++            arr_ids[&format!("{arr_phys}.element")]
++        );
++        assert_eq!(
++            id(format!("{m_phys}.key_value.key")),
++            m_ids[&format!("{m_phys}.key")]
++        );
++        assert_eq!(
++            id(format!("{m_phys}.key_value.value")),
++            m_ids[&format!("{m_phys}.value")]
++        );
++        assert_eq!(
++            id(format!("{m_phys}.key_value.value.list.element")),
++            m_ids[&format!("{m_phys}.value.element")]
++        );
++        assert_eq!(
++            id(format!("{s_phys}.{inner_phys}")),
++            inner.column_mapping_id().unwrap()
++        );
++        assert_eq!(
++            id(format!("{s_phys}.{inner_phys}.list.element")),
++            inner_ids[&format!("{inner_phys}.element")]
++        );
++
++        let data = get_data(&table).await;
++        assert_eq!(data.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
++    }
++
++    /// The property is refused without column mapping, together with deletion vectors or
++    /// IcebergCompatV1, and for types outside the IcebergCompatV2 allow-list.
++    #[tokio::test]
++    async fn test_iceberg_compat_v2_rejects_unsupported_configuration() {
++        use delta_kernel::schema::{DataType as KernelDataType, StructField};
++
++        let v2 = ("delta.enableIcebergCompatV2", "true");
++        let name = ("delta.columnMapping.mode", "name");
++        for (properties, message) in [
++            (vec![v2], "requires delta.columnMapping.mode"),
++            (
++                vec![name, v2, ("delta.enableDeletionVectors", "true")],
++                "delta.enableDeletionVectors",
++            ),
++            (
++                vec![name, v2, ("delta.enableIcebergCompatV1", "true")],
++                "delta.enableIcebergCompatV1",
++            ),
++        ] {
++            let err = DeltaTable::new_in_memory()
++                .create()
++                .with_columns(get_delta_schema().fields().cloned())
++                .with_configuration(properties.into_iter().map(|(k, v)| (k, Some(v))))
++                .await
++                .unwrap_err();
++            assert!(err.to_string().contains(message), "{err}");
++        }
++
++        let err = DeltaTable::new_in_memory()
++            .create()
++            .with_columns([StructField::new(
++                "v",
++                KernelDataType::unshredded_variant(),
++                true,
++            )])
++            .with_configuration([name, v2].into_iter().map(|(k, v)| (k, Some(v))))
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains("does not allow the type"), "{err}");
++    }
++
++    /// `delta.writePartitionColumnsToParquet` materializes without a writer feature.
++    #[tokio::test]
++    async fn test_write_partition_columns_to_parquet_property() {
++        let table = DeltaTable::new_in_memory()
++            .write(vec![get_record_batch(None, false)])
++            .with_partition_columns(["modified"])
++            .with_configuration([("delta.writePartitionColumnsToParquet", Some("true"))])
++            .await
++            .unwrap();
++        for file in table.snapshot().unwrap().log_data().iter() {
++            let columns = data_file_columns(&table, &file.object_store_path()).await;
++            assert_eq!(columns, ["id", "value", "modified"]);
++        }
++        assert_eq!(
++            get_data(&table)
++                .await
++                .iter()
++                .map(|b| b.num_rows())
++                .sum::<usize>(),
++            11
++        );
++    }
++
+     #[tokio::test]
+     async fn test_create_write() {
+         let table_schema = get_delta_schema();
+diff --git a/crates/core/src/table/config.rs b/crates/core/src/table/config.rs
+index ae9b412c..0149ef37 100644
+--- a/crates/core/src/table/config.rs
++++ b/crates/core/src/table/config.rs
+@@ -119,6 +119,21 @@ pub enum TableProperty {
+ 
+     /// 'classic' for classic Delta Lake checkpoints. 'v2' for v2 checkpoints.
+     CheckpointPolicy,
++
++    /// true for writers to also store partition column values in the data files, in the absence
++    /// of a writer feature (`materializePartitionColumns`, `icebergCompatV1/V2`) that requires it.
++    WritePartitionColumnsToParquet,
++
++    /// true to enable the `icebergCompatV1` writer feature (UniForm). Not supported by the
++    /// delta-rs writer; the key only parses so the property can be read.
++    EnableIcebergCompatV1,
++
++    /// true to enable the `icebergCompatV2` writer feature (UniForm): the data files can be
++    /// converted to Apache Iceberg (delta-rs does not generate the Iceberg metadata itself).
++    EnableIcebergCompatV2,
++
++    /// Formats to generate alongside Delta for UniForm, e.g. `iceberg`.
++    UniversalFormatEnabledFormats,
+ }
+ 
+ impl AsRef<str> for TableProperty {
+@@ -148,6 +163,10 @@ impl AsRef<str> for TableProperty {
+             Self::SetTransactionRetentionDuration => "delta.setTransactionRetentionDuration",
+             Self::TargetFileSize => "delta.targetFileSize",
+             Self::TuneFileSizesForRewrites => "delta.tuneFileSizesForRewrites",
++            Self::WritePartitionColumnsToParquet => "delta.writePartitionColumnsToParquet",
++            Self::EnableIcebergCompatV1 => "delta.enableIcebergCompatV1",
++            Self::EnableIcebergCompatV2 => "delta.enableIcebergCompatV2",
++            Self::UniversalFormatEnabledFormats => "delta.universalFormat.enabledFormats",
+         }
+     }
+ }
+@@ -185,6 +204,10 @@ impl FromStr for TableProperty {
+             "delta.setTransactionRetentionDuration" => Ok(Self::SetTransactionRetentionDuration),
+             "delta.targetFileSize" => Ok(Self::TargetFileSize),
+             "delta.tuneFileSizesForRewrites" => Ok(Self::TuneFileSizesForRewrites),
++            "delta.writePartitionColumnsToParquet" => Ok(Self::WritePartitionColumnsToParquet),
++            "delta.enableIcebergCompatV1" => Ok(Self::EnableIcebergCompatV1),
++            "delta.enableIcebergCompatV2" => Ok(Self::EnableIcebergCompatV2),
++            "delta.universalFormat.enabledFormats" => Ok(Self::UniversalFormatEnabledFormats),
+             _ => Err(DeltaTableError::Generic("unknown config key".into())),
+         }
+     }
+diff --git a/crates/core/src/writer/mod.rs b/crates/core/src/writer/mod.rs
+index b18976f0..38fa8d6c 100644
+--- a/crates/core/src/writer/mod.rs
++++ b/crates/core/src/writer/mod.rs
+@@ -43,6 +43,15 @@ pub(crate) fn ensure_legacy_writer_supports_table(
+             operation,
+         ));
+     }
++    // The legacy writers strip the partition columns from the data files unconditionally.
++    if crate::datafile::properties::materialize_partition_columns(
++        table.snapshot()?.snapshot().table_configuration(),
++    ) {
++        return Err(DeltaTableError::Generic(format!(
++            "{operation} does not support tables that materialize partition columns \
++             (materializePartitionColumns, icebergCompatV1/V2, delta.writePartitionColumnsToParquet)"
++        )));
++    }
+ 
+     Ok(())
+ }

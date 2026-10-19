@@ -10,6 +10,7 @@
 | 4 | `compaction-ordered-buffer-delays-commits` | #4749 | ★★ | 코드·git 이력 대조 | 1줄 fix 가능하나 먼저 이슈에 방향 질문 |
 | 5 | `nested-schema-override-widened-in-parquet-read` | #4678 | ★★★★ | `plan.rs` 단위 테스트 실패 확인 | 닫힌 PR 2개의 리뷰 코멘트 반영 필요 |
 | 6 | `optimize-tilde-partition-missing-files` | 미등록 | ★ | Python·Rust 로 main 에서 재현, 수정안 검증 | 파티션 값에 `~` → optimize 실패. 이슈 먼저 올릴 것 |
+| 7 | `iceberg-compat-v2-writer` | #3299 (C 안) | ★★★ | main `f67f1210` 에 프로토타입 적용, 새 테스트 4 개 + 전체 suite 통과 | 2번의 확장. PR 3 개(materializePartitionColumns → nested id → icebergCompatV2). 이슈에 방향 질문 먼저. `issue.md` 없음, `plan.md`·`pr.md`·`prototype.diff` |
 
 ## 해결됨 (done/)
 
