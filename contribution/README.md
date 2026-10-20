@@ -17,7 +17,7 @@
 |---|---|---|
 | `done/unity-catalog-null-expiration-time` | #3966 | PR 4884 머지(`3604f18a`, 2026-10-15), 이슈 close |
 | `done/unity-catalog-unknown-enum-values` | #3997 | PR 4885 머지(`2b656390`, 2026-10-15), 이슈 close |
-| `done/optimize-tilde-partition-missing-files` | #4918 | 이슈 등록 + PR 4919 open (2026-10-20) |
+| `done/optimize-tilde-partition-missing-files` | #4918 | PR 4919 머지(`3eb2316f`, 2026-10-20), 이슈 close |
 
 ## 검토했지만 제외한 open issue (PR 없음)
 

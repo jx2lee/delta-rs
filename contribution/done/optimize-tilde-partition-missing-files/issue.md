@@ -1,9 +1,9 @@
-> 이슈 #4918 등록, PR 4919 open (2026-10-20). 머지되면 커밋 해시를 적을 것.
+> 해결됨: PR 4919 머지, upstream main `3eb2316f` (2026-10-20) 에 반영. 이슈도 close(completed).
 
 # optimize fails with "File selection contains N missing files" when a partition value contains `~`
 
 - Issue: https://github.com/delta-io/delta-rs/issues/4918 (opened 2026-10-20)
-- Linked PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, open)
+- Linked PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, merged as `3eb2316f` on 2026-10-20)
 - Related (not duplicates):
   - #2146 path-encoding test umbrella
   - #4815 centralize path handling (lists `a~b` as a test value but doesn't report this bug)

@@ -1,4 +1,4 @@
-- PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, open; closes #4918)
+- PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, merged as `3eb2316f` on 2026-10-20; closes #4918)
 - Branch: `jx2lee/bug/optimize-tilde-partition-path` (commit `5b154d6d`)
 - Fix verified locally on upstream main `3604f18a` (2026-10-16):
   - the repro passes for `a~b`, `a b`, `a%b`, `a%20b`, `a/b`, `한글`, `a+b`, `a#b`, `[a]` and a plain date
