@@ -10,6 +10,7 @@
 | 4 | `compaction-ordered-buffer-delays-commits` | #4749 | ★★ | 코드·git 이력 대조 | 1줄 fix 가능하나 먼저 이슈에 방향 질문 |
 | 5 | `nested-schema-override-widened-in-parquet-read` | #4678 | ★★★★ | `plan.rs` 단위 테스트 실패 확인 | 닫힌 PR 2개의 리뷰 코멘트 반영 필요 |
 | 7 | `iceberg-compat-v2-writer` | #3299 (C 안) | ★★★ | main `f67f1210` 에 프로토타입 적용, 새 테스트 6 개 + 전체 suite 통과. Delta Spark UniForm 변환 + pyiceberg 읽기까지 확인 | 2번의 확장. PR 4 개(PR 0: 재작성 파일 `ARROW:schema` 의 view 타입 수정, main 버그·이슈 먼저 → materializePartitionColumns → nested id → icebergCompatV2). 이슈에 방향 질문 먼저. `issue.md` 없음, `plan.md`·`plan-integration.md`·`pr.md`·`prototype.diff`·`integration/` |
+| 8 | `write-preserve-input-order` | #4874 | ★★ | main `21f4376c` 에 프로토타입 적용, Rust 단위 테스트 2 개 + Python 테스트 1 개 통과 | `write_deltalake(preserve_order=True)` 옵션. 순서가 깨지는 곳은 optimizer 의 round-robin repartition. #2659 전력이 있어 이슈에 방향 질문 먼저 |
 
 ## 해결됨 (done/)
 
