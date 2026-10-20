@@ -72,38 +72,56 @@ Run: `cargo test -p deltalake-core --features datafusion --test it_datafusion re
 
 ## Issue draft (to file)
 
-Title: `optimize fails with "File selection contains N missing files" for partition values containing "~"`
+Follows `.github/ISSUE_TEMPLATE/bug_report.yml` (fields in form order; the dropdowns take one value each).
+
+Title: `[Bug]: optimize fails with "File selection contains N missing files" for partition values containing "~"`
+
+**What happened?**
 
 ```markdown
-# Environment
-
-**Delta-rs version**: 1.5.1 – 1.6.6, main (3604f18a). 1.5.0 works.
-**Binding**: python and rust
-**Environment**: local filesystem (macOS); the bug is in path-id normalization, not storage specific
-
-# Bug
-
-**What happened**:
-`optimize.compact()` fails (z-order shares the same scan path) on a table partitioned by a string column whose value contains `~`:
+`optimize.compact()` fails on a table partitioned by a string column whose value contains `~`
+(z-order goes through the same scan, so it fails the same way):
 
     DeltaError: Generic DeltaTable error: Error during planning: File selection contains 2 missing files
     (showing up to 10, redacted): file:///.../t/p=a%7Eb/part-00000-....snappy.parquet, ...
 
-The files exist at `p=a~b/...`, which is also what `add.path` says.
+The files exist at `p=a~b/...`, which is also what `add.path` says. Read, delete, update and merge on
+the same table work.
 
-**What you expected to happen**: the partition is compacted like any other.
+Cause: `FileSelection::from_adds` builds the selection id with `object_store::Path::from(add.path)`,
+which percent-encodes `~` (`%7E`). The scan builds the ids of active files from the raw log path, where
+`~` stays literal, so the ids never match and every selected file is reported missing. Values like
+`a b`, `a%b`, unicode or `/` are unaffected because `Path::from` happens to reproduce the log encoding
+for them; `~` is the only character object_store encodes that the partition-value encoding leaves alone.
 
-**How to reproduce it**:
+Regression: 1.5.0 works, 1.5.1 and later fail. Same on Rust `main` (3604f18a). Local filesystem, but the
+bug is in the path-id comparison, not storage specific. Related: #2146, #4815.
+```
 
+**Expected behavior**
+
+```markdown
+The partition is compacted like any other.
+```
+
+**Operating System**: macOS
+
+**Binding**: Python
+
+**Bindings Version**: `1.6.6` (also 1.5.1, 1.6.0, 1.6.1; Rust main 3604f18a)
+
+**Steps to reproduce**
+
+```markdown
     import pyarrow as pa
     from deltalake import DeltaTable, write_deltalake
     for _ in range(2):
         write_deltalake("t", pa.table({"p": ["a~b"], "n": [1]}), partition_by=["p"], mode="append")
     DeltaTable("t").optimize.compact()
+```
 
-**More details**:
-`FileSelection::from_adds` builds the selection id with `object_store::Path::from(add.path)`, which
-percent-encodes `~` (`%7E`). The scan builds ids for active files from the raw log path, where `~` stays
-literal, so the ids never match. Values like `a b`, `a%b`, unicode or `/` are unaffected because
-`Path::from` happens to reproduce the log encoding for them. Related: #2146, #4815.
+**Relevant logs** (rendered as shell, no backticks)
+
+```text
+DeltaError: Generic DeltaTable error: Error during planning: File selection contains 2 missing files (showing up to 10, redacted): file:///.../t/p=a%7Eb/part-00000-....snappy.parquet, file:///.../t/p=a%7Eb/part-00001-....snappy.parquet
 ```
