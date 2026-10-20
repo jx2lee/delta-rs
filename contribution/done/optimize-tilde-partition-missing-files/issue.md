@@ -1,6 +1,9 @@
+> 이슈 #4918 등록, PR 4919 open (2026-10-20). 머지되면 커밋 해시를 적을 것.
+
 # optimize fails with "File selection contains N missing files" when a partition value contains `~`
 
-- Issue: **not filed yet** (searched 2026-10-16: no issue/PR mentions this symptom). File the draft below first.
+- Issue: https://github.com/delta-io/delta-rs/issues/4918 (opened 2026-10-20)
+- Linked PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, open)
 - Related (not duplicates):
   - #2146 path-encoding test umbrella
   - #4815 centralize path handling (lists `a~b` as a test value but doesn't report this bug)
@@ -70,7 +73,7 @@ async fn repro_optimize_tilde_partition_value() -> Result<(), Box<dyn Error>> {
 Run: `cargo test -p deltalake-core --features datafusion --test it_datafusion repro_optimize_tilde -- --nocapture`
 (needs the `dat/` test data; `make setup-dat` or symlink an existing checkout's `dat/`).
 
-## Issue draft (to file)
+## Issue draft (filed as #4918)
 
 Follows `.github/ISSUE_TEMPLATE/bug_report.yml` (fields in form order; the dropdowns take one value each).
 

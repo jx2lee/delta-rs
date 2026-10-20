@@ -1,5 +1,5 @@
-- Branch: `jx2lee/fix/optimize-tilde-partition-path` (not created yet)
-- Prerequisite: file the issue in `issue.md` first, then put its number in `closes #...`
+- PR: https://github.com/delta-io/delta-rs/pull/4919 (opened 2026-10-20, open; closes #4918)
+- Branch: `jx2lee/bug/optimize-tilde-partition-path` (commit `5b154d6d`)
 - Fix verified locally on upstream main `3604f18a` (2026-10-16):
   - the repro passes for `a~b`, `a b`, `a%b`, `a%20b`, `a/b`, `한글`, `a+b`, `a#b`, `[a]` and a plain date
   - existing `file_selection` lib tests (29) and `command_optimize` integration tests (40) pass
@@ -29,7 +29,7 @@ Added a regression test that compacts partitions with `~`, space, `%`, unicode a
 
 # Related Issue(s)
 
-- closes #<new issue>
+- closes #4918
 - related #2146, #4815
 
 # Documentation
